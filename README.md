@@ -20,11 +20,23 @@ Image (screenshot or thumbnail) with labeled build style tags.
 
 ### How to collect
 
-Scrape images and metadata from GrabCraft website (https://www.grabcraft.com). The website contains thousands of Minecraft build blueprints. Each build in GrabCraft is labeled with tags (e.g., Tags: age of empires, castle, medieval, medieval castle).
+Scrape images and metadata from GrabCraft website (https://www.grabcraft.com). The website contains thousands of Minecraft build blueprints.
+
+Each build in GrabCraft is labeled with tags (e.g., Tags: age of empires, castle, medieval, medieval castle), which will be scripped and used as labels. Also, since some builds have more than one images, all images will be downloaded and saved in a separate folder.
 
 ---
 
 ## Modeling
+
+### Labels
+
+The usage of each tag appeared in the dataset will be calculated. After discarding meaningless tags, the most used ones will be selected as class labels.
+
+### Images
+
+For each build, all images will be sent to the model to improve accuracy.
+
+### Model
 
 Transfer learning with a pretrained CNN backbone such as **ResNet50** or **EfficientNet B0**, fine‑tuned on the GrabCraft images using cross‑entropy loss.
 
