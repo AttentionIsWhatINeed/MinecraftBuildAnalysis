@@ -1,0 +1,31 @@
+{
+  "best_val_loss": 0.22983488213448297,
+  "test_metrics": {
+    "precision_micro": 0.8139534883657834,
+    "recall_micro": 0.6325301204781173,
+    "f1_micro": 0.7118644062827003
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.4125321027738468,
+      "val_loss": 0.22983488213448297,
+      "precision_micro": 0.7681159420234195,
+      "recall_micro": 0.6928104575118117,
+      "f1_micro": 0.7285223362660808
+    }
+  ],
+  "classes": [
+    "bridge",
+    "fantasy",
+    "fountain",
+    "house",
+    "medieval",
+    "obelisk",
+    "siege",
+    "statue",
+    "truck",
+    "vehicle"
+  ],
+  "checkpoint": "D:\\@BU\\506 Data Science Tools & Apps\\MinecraftBuildAnalysis\\outputs\\best_multilabel_cnn.pt"
+}
