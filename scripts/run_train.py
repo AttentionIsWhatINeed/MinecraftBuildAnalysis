@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.amp import GradScaler
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -40,6 +40,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--snapshot-interval",
+        type=int,
+        default=50,
+        help="Save a training snapshot every N optimizer steps (0 disables snapshots)",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        type=Path,
+        default=None,
+        help="Directory for step snapshots (default: <output-dir>/snapshots)",
+    )
+    parser.add_argument(
+        "--loss-plot-file",
+        type=Path,
+        default=None,
+        help="Path to latest loss curve image (default: <output-dir>/latest_loss_curve.png)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -51,11 +69,81 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _save_step_snapshot(
+    snapshot_path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    tag_to_idx: dict,
+    idx_to_tag: list,
+    args: argparse.Namespace,
+    epoch: int,
+    global_step: int,
+) -> None:
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "tag_to_idx": tag_to_idx,
+            "idx_to_tag": idx_to_tag,
+            "args": vars(args),
+            "epoch": epoch,
+            "global_step": global_step,
+        },
+        snapshot_path,
+    )
+
+
+def _plot_latest_loss_curve(
+    loss_plot_file: Path,
+    step_losses: list[float],
+    train_epoch_losses: list[float],
+    val_epoch_losses: list[float],
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    loss_plot_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+    if step_losses:
+        step_axis = list(range(1, len(step_losses) + 1))
+        axes[0].plot(step_axis, step_losses, color="#3E7CB1", linewidth=1.2)
+    axes[0].set_title("Training Step Loss")
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(alpha=0.3)
+
+    if train_epoch_losses:
+        epoch_axis = list(range(1, len(train_epoch_losses) + 1))
+        axes[1].plot(epoch_axis, train_epoch_losses, marker="o", label="train_loss", color="#2A9D8F")
+    if val_epoch_losses:
+        epoch_axis = list(range(1, len(val_epoch_losses) + 1))
+        axes[1].plot(epoch_axis, val_epoch_losses, marker="o", label="val_loss", color="#E76F51")
+    axes[1].set_title("Epoch Loss")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Loss")
+    axes[1].grid(alpha=0.3)
+    if train_epoch_losses or val_epoch_losses:
+        axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(loss_plot_file, dpi=200)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_dir = args.snapshot_dir or (args.output_dir / "snapshots")
+    loss_plot_file = args.loss_plot_file or (args.output_dir / "latest_loss_curve.png")
 
     bundle = build_datasets(args.train_json, args.val_json, args.test_json, ROOT)
 
@@ -129,19 +217,64 @@ def main() -> None:
     print(f"AMP enabled: {use_amp}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Test samples: {len(test_ds)}")
     print(f"Classes ({len(bundle.idx_to_tag)}): {bundle.idx_to_tag}")
+    if args.snapshot_interval > 0:
+        print(f"Snapshot interval: every {args.snapshot_interval} steps")
+        print(f"Snapshot dir: {snapshot_dir}")
+    print(f"Latest loss plot: {loss_plot_file}")
 
     history = []
+    step_losses: list[float] = []
+    train_epoch_losses: list[float] = []
+    val_epoch_losses: list[float] = []
+    global_step = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-            scaler,
-            use_amp,
-        )
+        model.train()
+        train_running_loss = 0.0
+        train_running_count = 0
+        for images, targets in train_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type=device.type, enabled=use_amp):
+                logits = model(images)
+                loss = criterion(logits, targets)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_size = images.size(0)
+            loss_value = loss.item()
+            train_running_loss += loss_value * batch_size
+            train_running_count += batch_size
+
+            global_step += 1
+            step_losses.append(loss_value)
+
+            if args.snapshot_interval > 0 and global_step % args.snapshot_interval == 0:
+                snapshot_path = snapshot_dir / f"snapshot_step_{global_step:07d}.pt"
+                _save_step_snapshot(
+                    snapshot_path=snapshot_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    tag_to_idx=bundle.tag_to_idx,
+                    idx_to_tag=bundle.idx_to_tag,
+                    args=args,
+                    epoch=epoch,
+                    global_step=global_step,
+                )
+                _plot_latest_loss_curve(
+                    loss_plot_file=loss_plot_file,
+                    step_losses=step_losses,
+                    train_epoch_losses=train_epoch_losses,
+                    val_epoch_losses=val_epoch_losses,
+                )
+                print(f"[Snapshot] Saved at step {global_step}: {snapshot_path}")
+
+        train_loss = train_running_loss / max(train_running_count, 1)
         val_loss = run_epoch(
             model,
             val_loader,
@@ -161,14 +294,25 @@ def main() -> None:
 
         row = {
             "epoch": epoch,
+            "global_step": global_step,
             "train_loss": train_loss,
             "val_loss": val_loss,
             **val_metrics,
         }
         history.append(row)
+        train_epoch_losses.append(train_loss)
+        val_epoch_losses.append(val_loss)
+
+        _plot_latest_loss_curve(
+            loss_plot_file=loss_plot_file,
+            step_losses=step_losses,
+            train_epoch_losses=train_epoch_losses,
+            val_epoch_losses=val_epoch_losses,
+        )
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} | "
+            f"step={global_step} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"val_f1_micro={val_metrics['f1_micro']:.4f}"
@@ -213,8 +357,12 @@ def main() -> None:
         "best_val_loss": best_val_loss,
         "test_metrics": test_metrics,
         "history": history,
+        "train_step_losses": step_losses,
+        "train_epoch_losses": train_epoch_losses,
+        "val_epoch_losses": val_epoch_losses,
         "classes": bundle.idx_to_tag,
         "checkpoint": str(best_ckpt),
+        "latest_loss_plot": str(loss_plot_file),
     }
 
     metrics_file = args.output_dir / "training_metrics.json"

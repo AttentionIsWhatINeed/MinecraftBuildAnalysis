@@ -8,16 +8,19 @@ Then select a preset in generate_filtered_dataset.py or use these directly.
 # Predefined tag configurations
 TAG_PRESETS = {
     "custom": [
-        "medieval",
         "statue",
-        "house",
-        "fountain",
+        "decoration",
+        "art",
+        "comics",
+        "superhero",
         "fantasy",
-        "truck",
-        "siege",
-        "bridge",
+        "fictional",
+        "unfurnished",
+        "ww2",
+        "fountain",
+        "transportation",
         "vehicle",
-        "obelisk"
+        "outdoor"
     ],
     
     # Split tags presets (for use with enable_tag_splitting=True)

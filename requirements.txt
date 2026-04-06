@@ -4,3 +4,4 @@ beautifulsoup4==4.14.3
 pillow==12.1.0
 torch>=2.3.0
 torchvision>=0.18.0
+matplotlib>=3.8.0

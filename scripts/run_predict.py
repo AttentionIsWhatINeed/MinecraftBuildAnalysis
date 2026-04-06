@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.train.modeling import make_model, resolve_device
+from src.visualize.prediction_visualizer import PredictionVisualizer
 
 DEFAULT_TEST_JSON = ROOT / "data/processed/minecraft_builds_filtered_test.json"
 DEFAULT_CHECKPOINT = ROOT / "outputs/best_multilabel_cnn.pt"
@@ -40,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-json", type=Path, default=DEFAULT_TEST_JSON)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-file", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--viz-output-dir",
+        type=Path,
+        default=ROOT / "outputs/prediction_visualization",
+        help="Directory for prediction visualization outputs",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=224)
@@ -215,6 +222,9 @@ def main() -> None:
     with open(args.output_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
+    viz = PredictionVisualizer(result)
+    viz_outputs = viz.save_visualizations(output_dir=str(args.viz_output_dir))
+
     print("=" * 80)
     print("Inference complete: Multi-label Minecraft Test Set")
     print("=" * 80)
@@ -227,6 +237,9 @@ def main() -> None:
         f"f1_micro={metrics['f1_micro']:.4f}"
     )
     print(f"Saved predictions: {args.output_file}")
+    print(f"Saved prediction visualizations: {args.viz_output_dir}")
+    for key, path in viz_outputs.items():
+        print(f"  - {key}: {path}")
 
 
 if __name__ == "__main__":
