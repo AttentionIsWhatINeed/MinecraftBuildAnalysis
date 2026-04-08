@@ -12,7 +12,7 @@ from torchvision import transforms
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.train.dataset import MinecraftImageDataset, build_datasets
+from src.train.dataset import MinecraftBuildBagDataset, build_datasets
 from src.train.engine import evaluate_f1_micro, run_epoch
 from src.train.modeling import make_model, resolve_device
 from src.train.utils import set_seed
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-json", type=Path, default=DEFAULT_VAL_JSON)
     parser.add_argument("--test-json", type=Path, default=DEFAULT_TEST_JSON)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -40,9 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--max-images-per-build",
+        type=int,
+        default=6,
+        help="Max images per build in each training bag.",
+    )
+    parser.add_argument(
         "--snapshot-interval",
         type=int,
-        default=50,
+        default=160,
         help="Save a training snapshot every N optimizer steps (0 disables snapshots)",
     )
     parser.add_argument(
@@ -164,9 +170,24 @@ def main() -> None:
         ]
     )
 
-    train_ds = MinecraftImageDataset(bundle.train_samples, transform=train_tf)
-    val_ds = MinecraftImageDataset(bundle.val_samples, transform=eval_tf)
-    test_ds = MinecraftImageDataset(bundle.test_samples, transform=eval_tf)
+    train_ds = MinecraftBuildBagDataset(
+        bundle.train_build_samples,
+        transform=train_tf,
+        max_images_per_build=args.max_images_per_build,
+        train_mode=True,
+    )
+    val_ds = MinecraftBuildBagDataset(
+        bundle.val_build_samples,
+        transform=eval_tf,
+        max_images_per_build=args.max_images_per_build,
+        train_mode=False,
+    )
+    test_ds = MinecraftBuildBagDataset(
+        bundle.test_build_samples,
+        transform=eval_tf,
+        max_images_per_build=args.max_images_per_build,
+        train_mode=False,
+    )
 
     device = resolve_device(args.device)
     use_cuda = device.type == "cuda"
@@ -215,7 +236,8 @@ def main() -> None:
     if use_cuda:
         print(f"GPU: {torch.cuda.get_device_name(device)}")
     print(f"AMP enabled: {use_amp}")
-    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Test samples: {len(test_ds)}")
+    print(f"Max images per build: {args.max_images_per_build}")
+    print(f"Train builds: {len(train_ds)}, Val builds: {len(val_ds)}, Test builds: {len(test_ds)}")
     print(f"Classes ({len(bundle.idx_to_tag)}): {bundle.idx_to_tag}")
     if args.snapshot_interval > 0:
         print(f"Snapshot interval: every {args.snapshot_interval} steps")
@@ -232,13 +254,14 @@ def main() -> None:
         model.train()
         train_running_loss = 0.0
         train_running_count = 0
-        for images, targets in train_loader:
+        for images, mask, targets in train_loader:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type=device.type, enabled=use_amp):
-                logits = model(images)
+                logits = model(images, mask)
                 loss = criterion(logits, targets)
 
             scaler.scale(loss).backward()
@@ -327,6 +350,7 @@ def main() -> None:
                     "tag_to_idx": bundle.tag_to_idx,
                     "idx_to_tag": bundle.idx_to_tag,
                     "args": vars(args),
+                    "max_images_per_build": args.max_images_per_build,
                     "best_val_loss": best_val_loss,
                 },
                 best_ckpt,
@@ -354,6 +378,7 @@ def main() -> None:
     )
 
     metrics_out = {
+        "max_images_per_build": args.max_images_per_build,
         "best_val_loss": best_val_loss,
         "test_metrics": test_metrics,
         "history": history,

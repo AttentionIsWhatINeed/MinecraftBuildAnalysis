@@ -21,15 +21,16 @@ def run_epoch(
     total_loss = 0.0
     total_count = 0
 
-    for images, targets in loader:
+    for images, mask, targets in loader:
         images = images.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=use_amp):
-            logits = model(images)
+            logits = model(images, mask)
             loss = criterion(logits, targets)
 
         if train_mode:
@@ -58,12 +59,13 @@ def evaluate_f1_micro(
     fn = 0.0
 
     with torch.no_grad():
-        for images, targets in loader:
+        for images, mask, targets in loader:
             images = images.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                probs = torch.sigmoid(model(images))
+                probs = torch.sigmoid(model(images, mask))
             preds = (probs >= threshold).float()
 
             tp += (preds * targets).sum().item()
