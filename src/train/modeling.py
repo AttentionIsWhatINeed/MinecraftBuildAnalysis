@@ -82,8 +82,8 @@ class BuildAttentionMILModel(nn.Module):
         return self.classifier(pooled)
 
 
-def make_model(num_classes: int) -> nn.Module:
-    return BuildAttentionMILModel(num_classes=num_classes)
+def make_model(num_classes: int, dropout: float = 0.2) -> nn.Module:
+    return BuildAttentionMILModel(num_classes=num_classes, dropout=dropout)
 
 
 def resolve_device(device_arg: str) -> torch.device:

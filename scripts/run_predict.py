@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict, List
 
@@ -17,7 +18,8 @@ from src.train.modeling import make_model, resolve_device
 from src.visualize.prediction_visualizer import PredictionVisualizer
 
 DEFAULT_TEST_JSON = ROOT / "data/processed/minecraft_builds_filtered_test.json"
-DEFAULT_CHECKPOINT = ROOT / "outputs/best_multilabel_cnn.pt"
+# DEFAULT_CHECKPOINT = ROOT / "outputs/best_multilabel_cnn.pt"
+DEFAULT_CHECKPOINT = ROOT / "outputs/snapshots/snapshot_step_0001600.pt"
 DEFAULT_OUTPUT = ROOT / "outputs/test_predictions.json"
 
 
@@ -40,6 +42,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override max images per build used by MIL model (default: checkpoint value or 6).",
+    )
+    parser.add_argument(
+        "--threshold-mode",
+        type=str,
+        default="classwise",
+        choices=["classwise", "global"],
+        help="Prediction threshold mode. classwise uses thresholds saved in checkpoint if available.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
@@ -76,10 +85,28 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     idx_to_tag = checkpoint["idx_to_tag"]
     tag_to_idx = checkpoint["tag_to_idx"]
+    ckpt_args = checkpoint.get("args", {})
+    model_dropout = float(ckpt_args.get("dropout", checkpoint.get("dropout", 0.2)))
+    class_thresholds = checkpoint.get("class_thresholds", {})
+    ckpt_global_threshold = float(checkpoint.get("global_threshold", args.threshold))
     ckpt_max_images = checkpoint.get("max_images_per_build")
     if ckpt_max_images is None:
         ckpt_max_images = checkpoint.get("args", {}).get("max_images_per_build", 6)
     max_images_per_build = args.max_images_per_build or int(ckpt_max_images)
+
+    threshold_mode = args.threshold_mode
+    if threshold_mode == "classwise" and not class_thresholds:
+        warnings.warn(
+            "Checkpoint has no class_thresholds; falling back to global threshold mode.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        threshold_mode = "global"
+
+    if threshold_mode == "classwise":
+        threshold_values = [float(class_thresholds.get(tag, args.threshold)) for tag in idx_to_tag]
+    else:
+        threshold_values = [float(args.threshold)] * len(idx_to_tag)
 
     samples = build_build_samples(args.test_json, tag_to_idx, ROOT)
     if not samples:
@@ -114,9 +141,11 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
 
-    model = make_model(num_classes=len(idx_to_tag)).to(device)
+    model = make_model(num_classes=len(idx_to_tag), dropout=model_dropout).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+
+    threshold_tensor = torch.tensor(threshold_values, device=device).unsqueeze(0)
 
     all_probs: List[torch.Tensor] = []
     all_preds: List[torch.Tensor] = []
@@ -133,7 +162,7 @@ def main() -> None:
                 logits = model(images, mask)
                 probs = torch.sigmoid(logits)
 
-            preds = (probs >= args.threshold).float()
+            preds = (probs >= threshold_tensor).float()
 
             all_probs.append(probs.cpu())
             all_preds.append(preds.cpu())
@@ -172,6 +201,9 @@ def main() -> None:
         "test_json": str(args.test_json),
         "max_images_per_build": max_images_per_build,
         "threshold": args.threshold,
+        "checkpoint_global_threshold": ckpt_global_threshold,
+        "threshold_mode": threshold_mode,
+        "applied_thresholds": {idx_to_tag[i]: float(threshold_values[i]) for i in range(len(idx_to_tag))},
         "num_test_builds": len(samples),
         "num_classes": len(idx_to_tag),
         "classes": idx_to_tag,
@@ -190,6 +222,12 @@ def main() -> None:
     print("=" * 80)
     print(f"Device: {device}")
     print(f"AMP enabled: {use_amp}")
+    print(f"Model dropout: {model_dropout}")
+    print(f"Threshold mode: {threshold_mode}")
+    if threshold_mode == "global":
+        print(f"Global threshold: {args.threshold}")
+    else:
+        print("Global threshold: not used (classwise thresholds loaded from checkpoint)")
     print(f"Max images per build: {max_images_per_build}")
     print(f"Test builds: {len(samples)}")
     print(
