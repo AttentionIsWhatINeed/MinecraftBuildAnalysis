@@ -15,8 +15,11 @@ To change which tags are used:
 
 import sys
 import argparse
+import json
+from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Dict, List, Set
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -31,13 +34,225 @@ class GenerateConfig:
     """Runtime configuration for dataset generation."""
 
     preset: str = "custom"
-    split_tags: bool = False
+    label_mode: str = "auto"
+    manual_vocab_file: str | None = None
+    split_tags: bool = True
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
     seed: int = 42
     metadata_file: str = "data/raw/metadata/builds_metadata.json"
     output_dir: str = "data/processed"
+    max_labels: int = 24
+    min_tag_builds: int = 8
+    max_tag_ratio: float = 0.40
+    max_pair_jaccard: float = 0.80
+    vocab_report_file: str | None = None
+
+
+def _dedupe_keep_order(tags: List[str]) -> List[str]:
+    return list(dict.fromkeys(tags))
+
+
+def _normalize_tags(tags: List[str], split_tags: bool) -> List[str]:
+    normalized: List[str] = []
+    for raw in tags:
+        tag = str(raw).strip()
+        if not tag:
+            continue
+
+        if split_tags and " " in tag:
+            normalized.extend([w for w in tag.split() if w])
+        else:
+            normalized.append(tag)
+
+    return _dedupe_keep_order(normalized)
+
+
+def _jaccard(a: Set[int], b: Set[int]) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / max(union, 1)
+
+
+def _build_auto_label_vocab(
+    builds: List[Dict],
+    split_tags: bool,
+    max_labels: int,
+    min_tag_builds: int,
+    max_tag_ratio: float,
+    max_pair_jaccard: float,
+) -> tuple[List[str], Dict]:
+    total_builds = len(builds)
+    if total_builds == 0:
+        return [], {
+            "total_builds": 0,
+            "selected_tags": [],
+        }
+
+    tag_to_builds: Dict[str, Set[int]] = defaultdict(set)
+    for build_idx, build in enumerate(builds):
+        tags = _normalize_tags(build.get("tags", []), split_tags=split_tags)
+        for tag in tags:
+            tag_to_builds[tag].add(build_idx)
+
+    rows = []
+    low_support = []
+    too_generic = []
+
+    for tag, build_ids in tag_to_builds.items():
+        count = len(build_ids)
+        ratio = count / total_builds
+        row = {
+            "tag": tag,
+            "build_count": count,
+            "build_ratio": ratio,
+        }
+        rows.append(row)
+
+        if count < min_tag_builds:
+            low_support.append(tag)
+        elif ratio > max_tag_ratio:
+            too_generic.append(tag)
+
+    candidate_rows = [
+        r
+        for r in rows
+        if r["build_count"] >= min_tag_builds and r["build_ratio"] <= max_tag_ratio
+    ]
+    candidate_rows.sort(key=lambda r: (-r["build_count"], r["tag"]))
+
+    selected: List[str] = []
+    selected_sets: Dict[str, Set[int]] = {}
+    covered_builds: Set[int] = set()
+    remaining = candidate_rows.copy()
+
+    while remaining and len(selected) < max_labels:
+        best_idx = -1
+        best_gain = -1
+        best_count = -1
+
+        for i, row in enumerate(remaining):
+            tag = row["tag"]
+            tag_set = tag_to_builds[tag]
+
+            max_overlap = 0.0
+            for selected_tag, selected_set in selected_sets.items():
+                overlap = _jaccard(tag_set, selected_set)
+                if overlap > max_overlap:
+                    max_overlap = overlap
+
+            if max_overlap > max_pair_jaccard:
+                continue
+
+            gain = len(tag_set - covered_builds)
+            count = row["build_count"]
+
+            if gain > best_gain or (gain == best_gain and count > best_count):
+                best_gain = gain
+                best_count = count
+                best_idx = i
+
+        if best_idx < 0:
+            break
+
+        chosen = remaining.pop(best_idx)
+        chosen_tag = chosen["tag"]
+        selected.append(chosen_tag)
+        selected_sets[chosen_tag] = tag_to_builds[chosen_tag]
+        covered_builds |= tag_to_builds[chosen_tag]
+
+    if not selected and candidate_rows:
+        selected = [row["tag"] for row in candidate_rows[: max_labels]]
+        for tag in selected:
+            covered_builds |= tag_to_builds[tag]
+
+    report = {
+        "total_builds": total_builds,
+        "split_tags": split_tags,
+        "selection_params": {
+            "max_labels": max_labels,
+            "min_tag_builds": min_tag_builds,
+            "max_tag_ratio": max_tag_ratio,
+            "max_pair_jaccard": max_pair_jaccard,
+        },
+        "candidate_tags_total": len(rows),
+        "candidates_after_filter": len(candidate_rows),
+        "selected_count": len(selected),
+        "selected_tags": selected,
+        "retained_builds_by_selected_tags": len(covered_builds),
+        "retained_build_ratio": len(covered_builds) / total_builds,
+        "filtered_out": {
+            "low_support_count": len(low_support),
+            "too_generic_count": len(too_generic),
+            "low_support_examples": sorted(low_support)[:30],
+            "too_generic_examples": sorted(too_generic)[:30],
+        },
+        "top_candidates": candidate_rows[:100],
+    }
+    return selected, report
+
+
+def _load_manual_vocab(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Manual vocab file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+
+    if isinstance(obj, list):
+        return _dedupe_keep_order([str(t).strip() for t in obj if str(t).strip()])
+
+    if isinstance(obj, dict):
+        tags = obj.get("selected_tags", obj.get("tags", []))
+        if isinstance(tags, list):
+            return _dedupe_keep_order([str(t).strip() for t in tags if str(t).strip()])
+
+    raise ValueError(
+        "Manual vocab JSON must be a list of tags or an object with selected_tags/tags list."
+    )
+
+
+def _resolve_filter_tags(config: GenerateConfig, valid_builds: List[Dict], output_dir: Path) -> tuple[List[str], Dict]:
+    if config.label_mode == "preset":
+        tags = get_tags(config.preset)
+        return tags, {
+            "label_mode": "preset",
+            "selected_tags": tags,
+            "preset": config.preset,
+        }
+
+    if config.label_mode == "manual":
+        if config.manual_vocab_file is None:
+            raise ValueError("--manual-vocab-file is required when --label-mode manual")
+        path = Path(config.manual_vocab_file)
+        tags = _load_manual_vocab(path)
+        return tags, {
+            "label_mode": "manual",
+            "selected_tags": tags,
+            "manual_vocab_file": str(path),
+        }
+
+    tags, report = _build_auto_label_vocab(
+        builds=valid_builds,
+        split_tags=config.split_tags,
+        max_labels=config.max_labels,
+        min_tag_builds=config.min_tag_builds,
+        max_tag_ratio=config.max_tag_ratio,
+        max_pair_jaccard=config.max_pair_jaccard,
+    )
+
+    report["label_mode"] = "auto"
+
+    report_path = Path(config.vocab_report_file) if config.vocab_report_file else (output_dir / "auto_label_vocab_report.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    report["report_file"] = str(report_path)
+    return tags, report
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +261,19 @@ def parse_args() -> argparse.Namespace:
         description="Run dataset processing with configurable preset and split options."
     )
     parser.add_argument("--preset", default="custom", help="Tag preset name")
+    parser.add_argument(
+        "--label-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "preset", "manual"],
+        help="How to build final label dictionary.",
+    )
+    parser.add_argument(
+        "--manual-vocab-file",
+        type=str,
+        default=None,
+        help="Path to JSON tag dictionary used when --label-mode manual.",
+    )
     parser.add_argument(
         "--split-tags",
         action="store_true",
@@ -72,6 +300,36 @@ def parse_args() -> argparse.Namespace:
         default="data/processed",
         help="Output directory for generated JSON files",
     )
+    parser.add_argument(
+        "--max-labels",
+        type=int,
+        default=24,
+        help="Maximum number of labels when --label-mode auto.",
+    )
+    parser.add_argument(
+        "--min-tag-builds",
+        type=int,
+        default=8,
+        help="Minimum build count for a tag to be considered in auto mode.",
+    )
+    parser.add_argument(
+        "--max-tag-ratio",
+        type=float,
+        default=0.40,
+        help="Drop too-generic tags appearing in more than this ratio of builds.",
+    )
+    parser.add_argument(
+        "--max-pair-jaccard",
+        type=float,
+        default=0.80,
+        help="Avoid selecting near-duplicate tags with jaccard overlap above this value.",
+    )
+    parser.add_argument(
+        "--vocab-report-file",
+        type=str,
+        default=None,
+        help="Where to save auto-selected vocabulary report JSON.",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +338,8 @@ def run_from_cli() -> None:
     args = parse_args()
     config = GenerateConfig(
         preset=args.preset,
+        label_mode=args.label_mode,
+        manual_vocab_file=args.manual_vocab_file,
         split_tags=args.split_tags,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
@@ -87,6 +347,11 @@ def run_from_cli() -> None:
         seed=args.seed,
         metadata_file=args.metadata_file,
         output_dir=args.output_dir,
+        max_labels=args.max_labels,
+        min_tag_builds=args.min_tag_builds,
+        max_tag_ratio=args.max_tag_ratio,
+        max_pair_jaccard=args.max_pair_jaccard,
+        vocab_report_file=args.vocab_report_file,
     )
     main(config)
 
@@ -160,20 +425,37 @@ def main(config: GenerateConfig | None = None) -> None:
     print("[PHASE 2: TAG-BASED FILTERING & SPLITTING]")
     print("-" * 80)
     
-    # Step 4: User-specified tags
-    print("\n[Step 4] Configuring tag filter...")
-    
-    preset_name = config.preset
-    filter_tags = get_tags(preset_name)
-    
-    # Option to enable multi-word tag splitting
+    # Step 4: Build/select label dictionary
+    print("\n[Step 4] Building label dictionary...")
+
     enable_tag_splitting = config.split_tags
-    
-    print(f"Using '{preset_name}' preset: {len(filter_tags)} tags")
+    filter_tags, vocab_report = _resolve_filter_tags(config, valid_builds, output_dir)
+
+    if not filter_tags:
+        raise ValueError("No tags selected for filtering. Adjust label-mode settings.")
+
+    print(f"Label mode: {config.label_mode}")
+    if config.label_mode == "preset":
+        print(f"Preset: {config.preset}")
+    if config.label_mode == "manual":
+        print(f"Manual vocab file: {config.manual_vocab_file}")
+    if config.label_mode == "auto":
+        print(f"Auto-selected labels: {len(filter_tags)}")
+        print(
+            "Coverage by selected labels: "
+            f"{vocab_report.get('retained_builds_by_selected_tags', 0)}/"
+            f"{vocab_report.get('total_builds', 0)} "
+            f"({100 * vocab_report.get('retained_build_ratio', 0.0):.1f}%)"
+        )
+        if "report_file" in vocab_report:
+            print(f"Saved vocab report: {vocab_report['report_file']}")
+            print("You can manually edit selected_tags in this JSON and rerun with --label-mode manual.")
+
     if enable_tag_splitting:
-        print(f"✓ Multi-word tag splitting enabled")
-        print(f"  Example: 'working mechanism' will be split into 'working' and 'mechanism'")
-    print(f"Tags to filter:")
+        print("✓ Multi-word tag splitting enabled")
+        print("  Example: 'working mechanism' -> 'working', 'mechanism'")
+
+    print("Final tags to filter:")
     for i, tag in enumerate(filter_tags, 1):
         print(f"  {i:2d}. {tag}")
     

@@ -1,49 +1,75 @@
 import torch
 import warnings
 from torch import nn
+from torchvision import models
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+def _build_pretrained_backbone(backbone_name: str, pretrained: bool) -> tuple[nn.Module, int]:
+    if backbone_name == "resnet18":
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        net = models.resnet18(weights=weights)
+        feature_dim = net.fc.in_features
+        net.fc = nn.Identity()
+        return net, feature_dim
+
+    if backbone_name == "efficientnet_b0":
+        weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        net = models.efficientnet_b0(weights=weights)
+        feature_dim = net.classifier[1].in_features
+        net.classifier = nn.Identity()
+        return net, feature_dim
+
+    raise ValueError(
+        f"Unsupported backbone_name='{backbone_name}'. Supported: resnet18, efficientnet_b0"
+    )
+
+
+class PretrainedBuildImageEncoder(nn.Module):
+    def __init__(self, backbone_name: str = "resnet18", pretrained: bool = True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-        )
+        self.backbone_name = backbone_name
+        self.pretrained = pretrained
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        try:
+            backbone, feature_dim = _build_pretrained_backbone(backbone_name, pretrained)
+        except Exception as exc:
+            if not pretrained:
+                raise
 
+            warnings.warn(
+                f"Failed to load pretrained weights for '{backbone_name}': {exc}. "
+                "Falling back to randomly initialized backbone.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            backbone, feature_dim = _build_pretrained_backbone(backbone_name, pretrained=False)
 
-class BuildImageEncoder(nn.Module):
-    def __init__(self, feature_dim: int = 256):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            ConvBlock(3, 32),
-            ConvBlock(32, 64),
-            ConvBlock(64, 128),
-            ConvBlock(128, feature_dim),
-        )
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.backbone = backbone
         self.feature_dim = feature_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(x)
-        x = self.pool(x)
-        return x.flatten(1)
+        return self.backbone(x)
+
+    def set_trainable(self, trainable: bool) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = trainable
 
 
-class BuildAttentionMILModel(nn.Module):
-    """Encode each image with a CNN backbone, then aggregate per-build with attention."""
+class PretrainedBuildAttentionMILModel(nn.Module):
+    """Use an ImageNet backbone per image, then aggregate image embeddings with attention."""
 
-    def __init__(self, num_classes: int, dropout: float = 0.2):
+    def __init__(
+        self,
+        num_classes: int,
+        dropout: float = 0.2,
+        backbone_name: str = "resnet18",
+        pretrained_backbone: bool = True,
+    ):
         super().__init__()
-        self.encoder = BuildImageEncoder(feature_dim=256)
+        self.encoder = PretrainedBuildImageEncoder(
+            backbone_name=backbone_name,
+            pretrained=pretrained_backbone,
+        )
         in_features = self.encoder.feature_dim
 
         attn_hidden = max(in_features // 2, 128)
@@ -81,9 +107,22 @@ class BuildAttentionMILModel(nn.Module):
         pooled = torch.sum(encoded * attn_weights.unsqueeze(-1), dim=1)
         return self.classifier(pooled)
 
+    def set_backbone_trainable(self, trainable: bool) -> None:
+        self.encoder.set_trainable(trainable)
 
-def make_model(num_classes: int, dropout: float = 0.2) -> nn.Module:
-    return BuildAttentionMILModel(num_classes=num_classes, dropout=dropout)
+
+def make_model(
+    num_classes: int,
+    dropout: float = 0.2,
+    backbone_name: str = "resnet18",
+    pretrained_backbone: bool = True,
+) -> nn.Module:
+    return PretrainedBuildAttentionMILModel(
+        num_classes=num_classes,
+        dropout=dropout,
+        backbone_name=backbone_name,
+        pretrained_backbone=pretrained_backbone,
+    )
 
 
 def resolve_device(device_arg: str) -> torch.device:
