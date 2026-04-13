@@ -2,7 +2,7 @@
 Generate filtered dataset with tag-based filtering and splits.
 
 Workflow:
-1. DataProcessor: Load raw data and filter valid builds (remove builds without tags/images)
+1. DataProcessor: Load raw data, filter valid builds, and deduplicate builds
 2. DataProcessor: Display top tags as reference information
 3. TagFilter: Apply user-specified tag filtering
 4. TagFilter: Create train/val/test splits
@@ -121,10 +121,19 @@ def main(config: GenerateConfig | None = None) -> None:
     valid_builds = processor.filter_valid_builds(
         require_tags=True,
         require_images=True,
-        require_existing_files=False
+        require_existing_files=False,
     )
-    
-    print(f"✓ Loaded {len(valid_builds)} valid builds (removed builds without tags/images)")
+
+    filter_report = processor.last_filter_report
+    print(
+        f"✓ Loaded {len(valid_builds)} valid builds "
+        f"(removed builds without tags/images and deduplicated by identity)"
+    )
+    print(
+        f"  Deduplication: {filter_report.get('valid_before_dedup', len(valid_builds))} "
+        f"→ {filter_report.get('valid_after_dedup', len(valid_builds))} "
+        f"(removed {filter_report.get('duplicates_removed', 0)})"
+    )
     
     # Step 2: Display top tags as reference information
     print("\n[Step 2] Top tags reference information...")

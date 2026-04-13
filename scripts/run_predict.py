@@ -1,7 +1,6 @@
 import argparse
 import json
 import sys
-import warnings
 from pathlib import Path
 from typing import Dict, List
 
@@ -19,8 +18,9 @@ from src.visualize.prediction_visualizer import PredictionVisualizer
 
 DEFAULT_TEST_JSON = ROOT / "data/processed/minecraft_builds_filtered_test.json"
 # DEFAULT_CHECKPOINT = ROOT / "outputs/best_multilabel_cnn.pt"
-DEFAULT_CHECKPOINT = ROOT / "outputs/snapshots/snapshot_step_0001600.pt"
+DEFAULT_CHECKPOINT = ROOT / "outputs/snapshots/snapshot_step_0000640.pt"
 DEFAULT_OUTPUT = ROOT / "outputs/test_predictions.json"
+DEFAULT_TRAINING_METRICS = ROOT / "outputs/training_metrics.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +79,20 @@ def compute_micro_metrics(preds: torch.Tensor, targets: torch.Tensor) -> Dict[st
     }
 
 
+def _load_class_thresholds_from_metrics(metrics_file: Path) -> Dict[str, float]:
+    if not metrics_file.exists():
+        return {}
+
+    with open(metrics_file, "r", encoding="utf-8") as f:
+        metrics = json.load(f)
+
+    loaded = metrics.get("class_thresholds", {})
+    if not isinstance(loaded, dict):
+        return {}
+
+    return {str(k): float(v) for k, v in loaded.items()}
+
+
 def main() -> None:
     args = parse_args()
 
@@ -89,6 +103,7 @@ def main() -> None:
     model_dropout = float(ckpt_args.get("dropout", checkpoint.get("dropout", 0.2)))
     class_thresholds = checkpoint.get("class_thresholds", {})
     ckpt_global_threshold = float(checkpoint.get("global_threshold", args.threshold))
+    threshold_source = "checkpoint"
     ckpt_max_images = checkpoint.get("max_images_per_build")
     if ckpt_max_images is None:
         ckpt_max_images = checkpoint.get("args", {}).get("max_images_per_build", 6)
@@ -96,12 +111,15 @@ def main() -> None:
 
     threshold_mode = args.threshold_mode
     if threshold_mode == "classwise" and not class_thresholds:
-        warnings.warn(
-            "Checkpoint has no class_thresholds; falling back to global threshold mode.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        threshold_mode = "global"
+        class_thresholds = _load_class_thresholds_from_metrics(DEFAULT_TRAINING_METRICS)
+        if class_thresholds:
+            threshold_source = f"metrics:{DEFAULT_TRAINING_METRICS}"
+        else:
+            raise ValueError(
+                "Classwise threshold mode requested, but checkpoint has no class_thresholds and "
+                "outputs/training_metrics.json has no class_thresholds. Switch to --threshold-mode global "
+                "or rerun training to export classwise thresholds."
+            )
 
     if threshold_mode == "classwise":
         threshold_values = [float(class_thresholds.get(tag, args.threshold)) for tag in idx_to_tag]
@@ -175,6 +193,7 @@ def main() -> None:
     indices_t = torch.cat(all_indices, dim=0).tolist()
 
     metrics = compute_micro_metrics(preds_t, targets_t)
+    metrics_mode_label = "classwise thresholds" if threshold_mode == "classwise" else f"global={args.threshold:.2f}"
 
     prediction_rows: List[Dict] = []
     for out_i, sample_idx in enumerate(indices_t):
@@ -203,6 +222,8 @@ def main() -> None:
         "threshold": args.threshold,
         "checkpoint_global_threshold": ckpt_global_threshold,
         "threshold_mode": threshold_mode,
+        "metrics_mode": threshold_mode,
+        "threshold_source": threshold_source,
         "applied_thresholds": {idx_to_tag[i]: float(threshold_values[i]) for i in range(len(idx_to_tag))},
         "num_test_builds": len(samples),
         "num_classes": len(idx_to_tag),
@@ -227,11 +248,11 @@ def main() -> None:
     if threshold_mode == "global":
         print(f"Global threshold: {args.threshold}")
     else:
-        print("Global threshold: not used (classwise thresholds loaded from checkpoint)")
+        print(f"Global threshold: not used (classwise thresholds loaded from {threshold_source})")
     print(f"Max images per build: {max_images_per_build}")
     print(f"Test builds: {len(samples)}")
     print(
-        f"Metrics | precision_micro={metrics['precision_micro']:.4f} | "
+        f"Metrics ({metrics_mode_label}) | precision_micro={metrics['precision_micro']:.4f} | "
         f"recall_micro={metrics['recall_micro']:.4f} | "
         f"f1_micro={metrics['f1_micro']:.4f}"
     )

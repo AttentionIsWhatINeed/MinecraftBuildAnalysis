@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.train.dataset import MinecraftBuildBagDataset, build_datasets
-from src.train.engine import evaluate_f1_micro, run_epoch
+from src.train.engine import run_epoch
 from src.train.modeling import make_model, resolve_device
 from src.train.utils import set_seed
 
@@ -38,20 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--nesterov", action="store_true", help="Enable Nesterov momentum for SGD.")
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument(
-        "--lr-scheduler",
-        type=str,
-        default="plateau",
-        choices=["none", "plateau", "cosine"],
-        help="Learning-rate scheduler strategy.",
-    )
-    parser.add_argument("--lr-scheduler-patience", type=int, default=5)
-    parser.add_argument("--lr-scheduler-factor", type=float, default=0.5)
-    parser.add_argument("--lr-scheduler-min-lr", type=float, default=1e-6)
-    parser.add_argument("--lr-cosine-t-max", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--patience", type=int, default=20)
@@ -117,7 +108,6 @@ def _save_step_snapshot(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
-    scheduler,
     tag_to_idx: dict,
     idx_to_tag: list,
     args: argparse.Namespace,
@@ -130,7 +120,6 @@ def _save_step_snapshot(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "tag_to_idx": tag_to_idx,
             "idx_to_tag": idx_to_tag,
             "args": vars(args),
@@ -277,26 +266,6 @@ def _predict_with_class_thresholds(
     threshold_values = [float(class_thresholds.get(tag, default_threshold)) for tag in idx_to_tag]
     threshold_tensor = torch.tensor(threshold_values, dtype=probs.dtype).unsqueeze(0)
     return (probs >= threshold_tensor).float()
-
-
-def _build_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Namespace):
-    if args.lr_scheduler == "none":
-        return None
-
-    if args.lr_scheduler == "plateau":
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=args.lr_scheduler_factor,
-            patience=args.lr_scheduler_patience,
-            min_lr=args.lr_scheduler_min_lr,
-        )
-
-    return torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(args.lr_cosine_t_max, 1),
-        eta_min=args.lr_scheduler_min_lr,
-    )
 
 
 def _export_hard_sample_report(
@@ -467,8 +436,13 @@ def main() -> None:
     scaler = GradScaler(device.type, enabled=use_amp)
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = _build_scheduler(optimizer, args)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        nesterov=args.nesterov,
+    )
 
     best_val_loss = float("inf")
     epochs_without_improve = 0
@@ -482,9 +456,10 @@ def main() -> None:
         print(f"GPU: {torch.cuda.get_device_name(device)}")
     print(f"AMP enabled: {use_amp}")
     print(f"Dropout: {args.dropout}")
+    print(f"Momentum: {args.momentum}")
+    print(f"Nesterov: {args.nesterov}")
     print(f"Grad accumulation steps: {args.grad_accum_steps}")
     print(f"Max grad norm: {args.max_grad_norm}")
-    print(f"LR scheduler: {args.lr_scheduler}")
     if args.hard_sample_report_file is not None:
         print(
             f"Hard-sample report: split={args.hard_sample_split}, top_k={args.hard_sample_topk}, "
@@ -548,7 +523,6 @@ def main() -> None:
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
-                    scheduler=scheduler,
                     tag_to_idx=bundle.tag_to_idx,
                     idx_to_tag=bundle.idx_to_tag,
                     args=args,
@@ -573,19 +547,30 @@ def main() -> None:
             scaler=scaler,
             use_amp=use_amp,
         )
-        val_metrics = evaluate_f1_micro(
+        val_probs_epoch, val_targets_epoch = _collect_probs_targets(
             model,
             val_loader,
-            device,
-            threshold=args.threshold,
+            device=device,
             use_amp=use_amp,
         )
-
-        if scheduler is not None:
-            if args.lr_scheduler == "plateau":
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
+        val_preds_global_epoch = (val_probs_epoch >= args.threshold).float()
+        val_metrics = _compute_micro_metrics_from_preds(val_preds_global_epoch, val_targets_epoch)
+        epoch_class_thresholds = _search_class_thresholds(
+            probs=val_probs_epoch,
+            targets=val_targets_epoch,
+            idx_to_tag=bundle.idx_to_tag,
+            default_threshold=args.threshold,
+        )
+        val_preds_classwise_epoch = _predict_with_class_thresholds(
+            probs=val_probs_epoch,
+            idx_to_tag=bundle.idx_to_tag,
+            class_thresholds=epoch_class_thresholds,
+            default_threshold=args.threshold,
+        )
+        val_metrics_classwise_epoch = _compute_micro_metrics_from_preds(
+            val_preds_classwise_epoch,
+            val_targets_epoch,
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -596,6 +581,9 @@ def main() -> None:
             "train_loss": train_loss,
             "val_loss": val_loss,
             **val_metrics,
+            "precision_micro_classwise": val_metrics_classwise_epoch["precision_micro"],
+            "recall_micro_classwise": val_metrics_classwise_epoch["recall_micro"],
+            "f1_micro_classwise": val_metrics_classwise_epoch["f1_micro"],
         }
         history.append(row)
         train_epoch_losses.append(train_loss)
@@ -614,7 +602,8 @@ def main() -> None:
             f"lr={current_lr:.6g} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
-            f"val_f1_micro={val_metrics['f1_micro']:.4f}"
+            f"val_f1_micro_classwise={val_metrics_classwise_epoch['f1_micro']:.4f} | "
+            f"val_f1_micro_global={val_metrics['f1_micro']:.4f}"
         )
 
         if val_loss < best_val_loss:
@@ -626,10 +615,11 @@ def main() -> None:
                     "tag_to_idx": bundle.tag_to_idx,
                     "idx_to_tag": bundle.idx_to_tag,
                     "args": vars(args),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                     "grad_accum_steps": args.grad_accum_steps,
                     "max_grad_norm": args.max_grad_norm,
                     "dropout": args.dropout,
+                    "momentum": args.momentum,
+                    "nesterov": args.nesterov,
                     "max_images_per_build": args.max_images_per_build,
                     "best_val_loss": best_val_loss,
                 },
@@ -687,28 +677,28 @@ def main() -> None:
     torch.save(checkpoint, best_ckpt)
 
     print(
-        f"Validation metrics (global={args.threshold:.2f}) | "
-        f"precision_micro={val_metrics_global['precision_micro']:.4f} | "
-        f"recall_micro={val_metrics_global['recall_micro']:.4f} | "
-        f"f1_micro={val_metrics_global['f1_micro']:.4f}"
-    )
-    print(
-        "Validation metrics (classwise thresholds) | "
+        "Validation metrics (classwise thresholds, preferred) | "
         f"precision_micro={val_metrics_classwise['precision_micro']:.4f} | "
         f"recall_micro={val_metrics_classwise['recall_micro']:.4f} | "
         f"f1_micro={val_metrics_classwise['f1_micro']:.4f}"
     )
     print(
-        f"Test metrics (global={args.threshold:.2f}) | "
-        f"precision_micro={test_metrics_global['precision_micro']:.4f} | "
-        f"recall_micro={test_metrics_global['recall_micro']:.4f} | "
-        f"f1_micro={test_metrics_global['f1_micro']:.4f}"
+        f"Validation metrics (global={args.threshold:.2f}, reference) | "
+        f"precision_micro={val_metrics_global['precision_micro']:.4f} | "
+        f"recall_micro={val_metrics_global['recall_micro']:.4f} | "
+        f"f1_micro={val_metrics_global['f1_micro']:.4f}"
     )
     print(
-        "Test metrics (classwise thresholds) | "
+        "Test metrics (classwise thresholds, preferred) | "
         f"precision_micro={test_metrics['precision_micro']:.4f} | "
         f"recall_micro={test_metrics['recall_micro']:.4f} | "
         f"f1_micro={test_metrics['f1_micro']:.4f}"
+    )
+    print(
+        f"Test metrics (global={args.threshold:.2f}, reference) | "
+        f"precision_micro={test_metrics_global['precision_micro']:.4f} | "
+        f"recall_micro={test_metrics_global['recall_micro']:.4f} | "
+        f"f1_micro={test_metrics_global['f1_micro']:.4f}"
     )
 
     if args.hard_sample_report_file is not None and hard_sample_loader is not None and hard_sample_source is not None:
@@ -727,17 +717,16 @@ def main() -> None:
     metrics_out = {
         "max_images_per_build": args.max_images_per_build,
         "dropout": args.dropout,
+        "optimizer": "sgd",
+        "momentum": args.momentum,
+        "nesterov": args.nesterov,
         "grad_accum_steps": args.grad_accum_steps,
         "max_grad_norm": args.max_grad_norm,
-        "lr_scheduler": args.lr_scheduler,
-        "lr_scheduler_factor": args.lr_scheduler_factor,
-        "lr_scheduler_patience": args.lr_scheduler_patience,
-        "lr_scheduler_min_lr": args.lr_scheduler_min_lr,
-        "lr_cosine_t_max": args.lr_cosine_t_max,
         "hard_sample_report_file": str(args.hard_sample_report_file) if args.hard_sample_report_file else None,
         "hard_sample_topk": args.hard_sample_topk,
         "hard_sample_split": args.hard_sample_split,
         "global_threshold": float(args.threshold),
+        "primary_metric_mode": "classwise",
         "class_thresholds": class_thresholds,
         "threshold_grid": {
             "min": THRESHOLD_GRID_MIN,

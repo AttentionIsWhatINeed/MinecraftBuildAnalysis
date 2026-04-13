@@ -18,6 +18,7 @@ class DataProcessor:
     This class handles:
     - Loading raw metadata
     - Filtering datasets (removing builds without tags or images)
+    - Deduplicating builds (prefers unique build_url)
     - Validating image file existence
     - Generating statistics and tag distribution
     - Saving processed datasets
@@ -36,12 +37,87 @@ class DataProcessor:
         self.metadata_file = Path(metadata_file)
         self.raw_data: List[Dict] = []
         self.processed_data: List[Dict] = []
+        self.last_filter_report: Dict[str, int] = {}
         
         if not self.metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_file}")
         
         self._load_metadata()
         logger.info(f"Loaded {len(self.raw_data)} builds from {self.metadata_file}")
+
+    def _normalize_key_value(self, value: str) -> str:
+        """Normalize key text for deduplication comparisons."""
+        return value.strip().lower().replace('\\', '/')
+
+    def _build_identity_key(self, build: Dict) -> Optional[str]:
+        """Create a stable identity key for deduplicating builds."""
+        build_url = self._normalize_key_value(str(build.get('build_url', '')))
+        if build_url:
+            return f"url::{build_url}"
+
+        build_dir = self._normalize_key_value(str(build.get('build_directory', '')))
+        if build_dir:
+            return f"dir::{build_dir}"
+
+        local_image_paths = build.get('local_image_paths', []) or []
+        if local_image_paths:
+            first_image = self._normalize_key_value(str(local_image_paths[0]))
+            if first_image:
+                return f"img::{first_image}"
+
+        title = self._normalize_key_value(str(build.get('title', '')))
+        if title:
+            return f"title::{title}"
+
+        return None
+
+    def _build_quality_score(self, build: Dict) -> tuple[int, int, int]:
+        """Score a build record quality; higher score is preferred when deduplicating."""
+        local_image_paths = build.get('local_image_paths', []) or []
+        tags = build.get('tags', []) or []
+
+        images_count = build.get('images_count', 0)
+        if not isinstance(images_count, int):
+            try:
+                images_count = int(images_count)
+            except (TypeError, ValueError):
+                images_count = 0
+
+        return (images_count, len(local_image_paths), len(tags))
+
+    def _deduplicate_builds(self, builds: List[Dict]) -> tuple[List[Dict], int]:
+        """Remove duplicate builds while preserving order of first-seen identities."""
+        if not builds:
+            return builds, 0
+
+        deduped: List[Dict] = []
+        key_to_index: Dict[str, int] = {}
+        key_to_quality: Dict[str, tuple[int, int, int]] = {}
+        duplicates_removed = 0
+
+        for build in builds:
+            key = self._build_identity_key(build)
+
+            # Keep records without reliable identity key; only keyed records are deduplicated.
+            if key is None:
+                deduped.append(build)
+                continue
+
+            quality = self._build_quality_score(build)
+            existing_idx = key_to_index.get(key)
+
+            if existing_idx is None:
+                key_to_index[key] = len(deduped)
+                key_to_quality[key] = quality
+                deduped.append(build)
+                continue
+
+            duplicates_removed += 1
+            if quality > key_to_quality[key]:
+                deduped[existing_idx] = build
+                key_to_quality[key] = quality
+
+        return deduped, duplicates_removed
     
     def _load_metadata(self):
         """Load metadata from JSON file."""
@@ -111,12 +187,25 @@ class DataProcessor:
                     logger.debug(f"Build {idx} ({build.get('title', 'Unknown')}): "
                                 f"Filtered out - {', '.join(reasons)}")
         
+        valid_before_dedup = len(valid_builds)
+        valid_builds, duplicates_removed = self._deduplicate_builds(valid_builds)
+        if duplicates_removed > 0:
+            logger.info(f"Deduplication removed {duplicates_removed} duplicate builds")
+
         self.processed_data = valid_builds
         
         total = len(self.raw_data)
         valid = len(valid_builds)
+        retention_pct = (100 * valid / total) if total else 0.0
         logger.info(f"Filtering complete: {valid}/{total} builds valid "
-                   f"({100*valid/total:.1f}% retention)")
+                   f"({retention_pct:.1f}% retention)")
+
+        self.last_filter_report = {
+            'raw_total': total,
+            'valid_before_dedup': valid_before_dedup,
+            'duplicates_removed': duplicates_removed,
+            'valid_after_dedup': valid,
+        }
         
         return valid_builds
     
