@@ -1,1 +1,1 @@
-"""Configuration package for dataset filtering presets."""
+"""Configuration package for dataset tag filtering."""

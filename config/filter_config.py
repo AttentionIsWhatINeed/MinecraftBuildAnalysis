@@ -1,83 +1,24 @@
-"""
-Filter configuration for dataset generation.
+"""Blacklist configuration used by tag filtering in dataset generation."""
 
-Edit the TAG_PRESETS below to customize which tags are used for filtering.
-Then select a preset in generate_filtered_dataset.py or use these directly.
-"""
-
-# Predefined tag configurations
-TAG_PRESETS = {
-    "custom": [
-        "statue",
-        "decoration",
-        "art",
-        "comics",
-        "superhero",
-        "fantasy",
-        "fictional",
-        "unfurnished",
-        "ww2",
-        "fountain",
-        "transportation",
-        "vehicle",
-        "outdoor"
-    ],
-    
-    # Split tags presets (for use with enable_tag_splitting=True)
-    # Generated from split tags analysis
-    
-    "split_top_10": [
-        "medieval", "decoration", "statue", "house", "small",
-        "fountain", "comics", "fantasy", "outdoor", "working"
-    ],
-    
-    "split_top_20": [
-        "medieval", "decoration", "statue", "house", "small",
-        "fountain", "comics", "fantasy", "outdoor", "working",
-        "truck", "unfurnished", "mechanism", "siege", "bridge",
-        "vehicle", "obelisk", "steampunk", "building", "trailer"
-    ],
-    
-    "split_top_30": [
-        "medieval", "decoration", "statue", "house", "small",
-        "fountain", "comics", "fantasy", "outdoor", "working",
-        "truck", "unfurnished", "mechanism", "siege", "bridge",
-        "vehicle", "obelisk", "steampunk", "building", "trailer",
-        "church", "modern", "farm", "piston", "bus",
-        "castle", "ruins", "character", "pixel", "art"
-    ]
-}
+# Tags listed here will be removed from each build during processing.
+BLACKLIST_TAGS = [
+    "medieval",
+]
 
 
-def get_tags(preset_name: str = "custom") -> list:
-    """
-    Get tags for a specific preset.
-    
-    Args:
-        preset_name: Name of the preset to use
-        
-    Returns:
-        List of tags
-    """
-    if preset_name not in TAG_PRESETS:
-        raise ValueError(f"Unknown preset: {preset_name}")
-    
-    tags = TAG_PRESETS[preset_name]
-    
-    if not tags:
-        raise ValueError(f"Preset '{preset_name}' has no tags configured")
-    
-    return tags
-
-
-def list_presets():
-    """Print all available presets."""
-    print("Available tag presets:")
-    for name, tags in TAG_PRESETS.items():
-        print(f"  '{name}': {len(tags)} tags")
-        if tags:
-            print(f"    {tags[:3]}{'...' if len(tags) > 3 else ''}")
+def get_blacklist_tags() -> list[str]:
+    """Return normalized blacklist tags with duplicates removed."""
+    normalized: list[str] = []
+    for raw in BLACKLIST_TAGS:
+        tag = str(raw).strip()
+        if not tag:
+            continue
+        normalized.append(tag)
+    return list(dict.fromkeys(normalized))
 
 
 if __name__ == "__main__":
-    list_presets()
+    tags = get_blacklist_tags()
+    print(f"Configured blacklist tags: {len(tags)}")
+    for idx, tag in enumerate(tags, 1):
+        print(f"  {idx:2d}. {tag}")
