@@ -46,14 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-tags",
         action="store_true",
-        default=True,
-        help="Enable splitting of multi-word tags (default: enabled)",
-    )
-    parser.add_argument(
-        "--no-split-tags",
-        action="store_false",
-        dest="split_tags",
-        help="Disable splitting of multi-word tags",
+        default=False,
+        help="Enable splitting of multi-word tags (default: disabled)",
     )
     parser.add_argument(
         "--min-tag-occurrences",

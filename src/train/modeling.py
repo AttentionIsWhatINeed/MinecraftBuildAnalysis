@@ -25,17 +25,14 @@ def _build_pretrained_backbone(backbone_name: str, pretrained: bool) -> tuple[nn
 
 
 class PretrainedBuildImageEncoder(nn.Module):
-    def __init__(self, backbone_name: str = "resnet18", pretrained: bool = True):
+    def __init__(self, backbone_name: str = "resnet18"):
         super().__init__()
         self.backbone_name = backbone_name
-        self.pretrained = pretrained
+        self.pretrained = True
 
         try:
-            backbone, feature_dim = _build_pretrained_backbone(backbone_name, pretrained)
+            backbone, feature_dim = _build_pretrained_backbone(backbone_name, pretrained=True)
         except Exception as exc:
-            if not pretrained:
-                raise
-
             warnings.warn(
                 f"Failed to load pretrained weights for '{backbone_name}': {exc}. "
                 "Falling back to randomly initialized backbone.",
@@ -61,38 +58,27 @@ class MILModel(nn.Module):
         num_classes: int,
         dropout: float = 0.2,
         backbone_name: str = "resnet18",
-        pretrained_backbone: bool = True,
-        class_specific_attention: bool = False,
     ):
         super().__init__()
         self.num_classes = int(num_classes)
-        self.class_specific_attention = bool(class_specific_attention)
         self.encoder = PretrainedBuildImageEncoder(
             backbone_name=backbone_name,
-            pretrained=pretrained_backbone,
         )
         in_features = self.encoder.feature_dim
 
         attn_hidden = max(in_features // 2, 128)
-        attn_out_dim = self.num_classes if self.class_specific_attention else 1
+        attn_out_dim = self.num_classes
         self.attention = nn.Sequential(
             nn.Linear(in_features, attn_hidden),
             nn.Tanh(),
             nn.Linear(attn_hidden, attn_out_dim),
         )
 
-        if self.class_specific_attention:
-            self.classifier_norm = nn.LayerNorm(in_features)
-            self.classifier_dropout = nn.Dropout(dropout)
-            self.classifier_weight = nn.Parameter(torch.empty(self.num_classes, in_features))
-            self.classifier_bias = nn.Parameter(torch.zeros(self.num_classes))
-            nn.init.xavier_uniform_(self.classifier_weight)
-        else:
-            self.classifier = nn.Sequential(
-                nn.LayerNorm(in_features),
-                nn.Dropout(dropout),
-                nn.Linear(in_features, self.num_classes),
-            )
+        self.classifier_norm = nn.LayerNorm(in_features)
+        self.classifier_dropout = nn.Dropout(dropout)
+        self.classifier_weight = nn.Parameter(torch.empty(self.num_classes, in_features))
+        self.classifier_bias = nn.Parameter(torch.zeros(self.num_classes))
+        nn.init.xavier_uniform_(self.classifier_weight)
 
     def forward(self, images: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         if images.dim() != 5:
@@ -110,27 +96,17 @@ class MILModel(nn.Module):
 
         attn_scores = self.attention(encoded)
 
-        if self.class_specific_attention:
-            mask_3d = mask.unsqueeze(-1)
-            attn_scores = attn_scores.masked_fill(~mask_3d, -1e4)
-            attn_weights = torch.softmax(attn_scores, dim=1)
-            attn_weights = attn_weights * mask_3d.float()
-            attn_weights = attn_weights / attn_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-
-            pooled = torch.einsum("bnc,bnd->bcd", attn_weights, encoded)
-            pooled = self.classifier_norm(pooled)
-            pooled = self.classifier_dropout(pooled)
-            logits = torch.einsum("bcd,cd->bc", pooled, self.classifier_weight)
-            return logits + self.classifier_bias
-
-        attn_scores = attn_scores.squeeze(-1)
-        attn_scores = attn_scores.masked_fill(~mask, -1e4)
+        mask_3d = mask.unsqueeze(-1)
+        attn_scores = attn_scores.masked_fill(~mask_3d, -1e4)
         attn_weights = torch.softmax(attn_scores, dim=1)
-        attn_weights = attn_weights * mask.float()
+        attn_weights = attn_weights * mask_3d.float()
         attn_weights = attn_weights / attn_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-        pooled = torch.sum(encoded * attn_weights.unsqueeze(-1), dim=1)
-        return self.classifier(pooled)
+        pooled = torch.einsum("bnc,bnd->bcd", attn_weights, encoded)
+        pooled = self.classifier_norm(pooled)
+        pooled = self.classifier_dropout(pooled)
+        logits = torch.einsum("bcd,cd->bc", pooled, self.classifier_weight)
+        return logits + self.classifier_bias
 
     def set_backbone_trainable(self, trainable: bool) -> None:
         self.encoder.set_trainable(trainable)
@@ -140,15 +116,11 @@ def make_model(
     num_classes: int,
     dropout: float = 0.2,
     backbone_name: str = "resnet18",
-    pretrained_backbone: bool = True,
-    class_specific_attention: bool = False,
 ) -> nn.Module:
     return MILModel(
         num_classes=num_classes,
         dropout=dropout,
         backbone_name=backbone_name,
-        pretrained_backbone=pretrained_backbone,
-        class_specific_attention=class_specific_attention,
     )
 
 

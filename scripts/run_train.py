@@ -44,43 +44,19 @@ def parse_args() -> argparse.Namespace:
         help="Backbone for pretrained MIL model.",
     )
     parser.add_argument(
-        "--pretrained-backbone",
-        action="store_true",
-        default=True,
-        help="Load ImageNet pretrained weights for pretrained backbone.",
-    )
-    parser.add_argument(
-        "--no-pretrained-backbone",
-        action="store_false",
-        dest="pretrained_backbone",
-        help="Disable pretrained ImageNet weights.",
-    )
-    parser.add_argument(
-        "--class-specific-attention",
-        action="store_true",
-        default=True,
-        help="Use per-class attention maps over bag images.",
-    )
-    parser.add_argument(
-        "--no-class-specific-attention",
-        action="store_false",
-        dest="class_specific_attention",
-        help="Disable per-class attention and use shared MIL attention.",
-    )
-    parser.add_argument(
         "--freeze-backbone-epochs",
         type=int,
         default=2,
-        help="Freeze pretrained backbone for first N epochs before full finetuning.",
+        help="Freeze backbone for first N epochs before full finetuning.",
     )
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--backbone-lr",
         type=float,
         default=None,
-        help="Optional LR for backbone parameters (default: 0.1 * --lr when pretrained backbone is used)",
+        help="Optional LR for backbone parameters (default: 0.1 * --lr).",
     )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -89,7 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
         "--asl-gamma-neg",
         type=float,
@@ -115,25 +90,6 @@ def parse_args() -> argparse.Namespace:
         help="ASL epsilon for numerical stability.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--hard-sample-report-file",
-        type=Path,
-        default=None,
-        help="Optional JSON path to save top high-loss samples for data quality inspection.",
-    )
-    parser.add_argument(
-        "--hard-sample-topk",
-        type=int,
-        default=30,
-        help="Number of high-loss samples to keep in hard-sample report.",
-    )
-    parser.add_argument(
-        "--hard-sample-split",
-        type=str,
-        default="val",
-        choices=["train", "val"],
-        help="Which split to analyze when exporting hard-sample report.",
-    )
     parser.add_argument(
         "--max-images-per-build",
         type=int,
@@ -176,13 +132,13 @@ def parse_args() -> argparse.Namespace:
         help="Resume training from state file.",
     )
     parser.add_argument(
-        "--resume-state",
+        "--resume-state-file-path",
         type=Path,
         default=None,
         help="Path to saved training state file (default: <output-dir>/last_training_state.pt)",
     )
     parser.add_argument(
-        "--state-file",
+        "--save-state-file-path",
         type=Path,
         default=None,
         help="Where to save resumable training state (default: <output-dir>/last_training_state.pt)",
@@ -193,9 +149,6 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Training device: auto | cpu | cuda | cuda:0 ...",
     )
-    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision")
-    parser.add_argument("--no-amp", action="store_false", dest="amp", help="Disable mixed precision")
-    parser.set_defaults(amp=True)
     return parser.parse_args()
 
 
@@ -284,7 +237,7 @@ def _save_training_state(
     state_file.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "state_version": 1,
+            "state_version": 2,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -470,60 +423,29 @@ def _compute_set_match_metrics_from_preds(preds: torch.Tensor, targets: torch.Te
     }
 
 
-def _per_sample_set_match_loss_from_probs(probs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    tp = (probs * targets).sum(dim=1)
-    fp = (probs * (1.0 - targets)).sum(dim=1)
-    fn = ((1.0 - probs) * targets).sum(dim=1)
-    sample_f1 = (2.0 * tp + 1e-9) / (2.0 * tp + fp + fn + 1e-9)
-    return 1.0 - sample_f1
-
-
 def _make_threshold_candidates() -> list[float]:
     count = int(round((THRESHOLD_GRID_MAX - THRESHOLD_GRID_MIN) / THRESHOLD_GRID_STEP)) + 1
     return [round(THRESHOLD_GRID_MIN + i * THRESHOLD_GRID_STEP, 4) for i in range(count)]
 
 
-def _search_global_threshold_for_set_match(
-    probs: torch.Tensor,
-    targets: torch.Tensor,
-    default_threshold: float,
-) -> tuple[float, float]:
-    candidates = _make_threshold_candidates()
-    best_th = float(default_threshold)
-    best_score = -1.0
-
-    for th in candidates:
-        preds = (probs >= th).float()
-        score = _compute_set_match_metrics_from_preds(preds, targets)["sample_f1"]
-
-        if score > best_score + 1e-12:
-            best_score = score
-            best_th = th
-        elif abs(score - best_score) <= 1e-12 and abs(th - default_threshold) < abs(best_th - default_threshold):
-            best_th = th
-
-    return float(best_th), float(best_score)
-
-
 def _apply_threshold_vector(probs: torch.Tensor, threshold_values: list[float]) -> torch.Tensor:
-    threshold_tensor = torch.tensor(threshold_values, dtype=probs.dtype).unsqueeze(0)
+    threshold_tensor = torch.tensor(threshold_values, dtype=probs.dtype, device=probs.device).unsqueeze(0)
     return (probs >= threshold_tensor).float()
 
 
 def _search_classwise_thresholds_for_binary_f1(
     probs: torch.Tensor,
     targets: torch.Tensor,
-    default_threshold: float,
 ) -> tuple[list[float], float]:
     candidates = _make_threshold_candidates()
     num_classes = int(probs.size(1))
-    thresholds = [float(default_threshold)] * num_classes
+    thresholds = [float(candidates[0])] * num_classes
 
     per_class_f1_scores: list[float] = []
 
     for class_idx in range(num_classes):
         target_col = targets[:, class_idx]
-        local_best_th = float(default_threshold)
+        local_best_th = float(candidates[0])
         local_best_score = -1.0
 
         for th in candidates:
@@ -532,10 +454,6 @@ def _search_classwise_thresholds_for_binary_f1(
 
             if trial_score > local_best_score + 1e-12:
                 local_best_score = trial_score
-                local_best_th = th
-            elif abs(trial_score - local_best_score) <= 1e-12 and abs(th - default_threshold) < abs(
-                local_best_th - default_threshold
-            ):
                 local_best_th = th
 
         thresholds[class_idx] = float(local_best_th)
@@ -549,73 +467,7 @@ def _resolve_backbone_lr(args: argparse.Namespace) -> float:
     if args.backbone_lr is not None:
         return float(args.backbone_lr)
 
-    if bool(args.pretrained_backbone):
-        return float(args.lr) * 0.1
-
-    return float(args.lr)
-
-
-def _export_hard_sample_report(
-    model: nn.Module,
-    loader: DataLoader,
-    samples: list[dict],
-    idx_to_tag: list[str],
-    device: torch.device,
-    use_amp: bool,
-    output_file: Path,
-    top_k: int,
-) -> None:
-    model.eval()
-    rows: list[dict] = []
-
-    with torch.no_grad():
-        for images, mask, targets, indices in loader:
-            images = images.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-
-            with autocast(device_type=device.type, enabled=use_amp):
-                logits = model(images, mask)
-                probs = torch.sigmoid(logits)
-
-            per_sample_losses = _per_sample_set_match_loss_from_probs(probs, targets)
-
-            probs_cpu = probs.cpu()
-            losses_cpu = per_sample_losses.cpu()
-            indices_cpu = indices.cpu().tolist()
-
-            for local_i, sample_idx in enumerate(indices_cpu):
-                sample = samples[sample_idx]
-                prob_vec = probs_cpu[local_i].tolist()
-                top3 = sorted(
-                    ((idx_to_tag[i], float(prob_vec[i])) for i in range(len(idx_to_tag))),
-                    key=lambda x: x[1],
-                    reverse=True,
-                )[:3]
-
-                rows.append(
-                    {
-                        "loss": float(losses_cpu[local_i].item()),
-                        "title": sample.get("title", ""),
-                        "build_url": sample.get("build_url", ""),
-                        "num_images": len(sample.get("image_paths", [])),
-                        "true_tags": sample.get("true_tags", []),
-                        "top3_pred_probs": [{"tag": tag, "prob": prob} for tag, prob in top3],
-                    }
-                )
-
-    rows.sort(key=lambda x: x["loss"], reverse=True)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "num_rows": len(rows),
-                "top_k": top_k,
-                "samples": rows[: max(top_k, 1)],
-            },
-            f,
-            indent=2,
-        )
+    return float(args.lr) * 0.1
 
 
 def _build_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -646,31 +498,21 @@ def main() -> None:
         raise ValueError("--asl-gamma-neg and --asl-gamma-pos must be >= 0")
     if args.asl_eps <= 0:
         raise ValueError("--asl-eps must be > 0")
+    if args.grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1")
+    if args.weight_decay < 0:
+        raise ValueError("--weight-decay must be >= 0")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir = args.snapshot_dir or (args.output_dir / "snapshots")
     loss_plot_file = args.loss_plot_file or (args.output_dir / "latest_loss_curve.png")
     log_file = args.log_file or (args.output_dir / "train_debug.log")
     events_file = args.events_file or (args.output_dir / "training_events.jsonl")
-    state_file = args.state_file or (args.output_dir / "last_training_state.pt")
-    resume_state_file = args.resume_state or state_file
+    save_state_file_path = args.save_state_file_path or (args.output_dir / "last_training_state.pt")
+    resume_state_file_path = args.resume_state_file_path or save_state_file_path
 
-    resume_state_preview = None
-    if args.resume:
-        if not resume_state_file.exists():
-            raise FileNotFoundError(
-                f"Resume requested, but state file not found: {resume_state_file}"
-            )
-
-        resume_state_preview = torch.load(resume_state_file, map_location="cpu", weights_only=False)
-        resume_args = resume_state_preview.get("args", {})
-        if "class_specific_attention" in resume_args:
-            args.class_specific_attention = bool(resume_args["class_specific_attention"])
-        elif "class_specific_attention" in resume_state_preview:
-            args.class_specific_attention = bool(resume_state_preview["class_specific_attention"])
-        else:
-            # Backward compatibility for old checkpoints before class-specific attention existed.
-            args.class_specific_attention = False
+    if args.resume and not resume_state_file_path.exists():
+        raise FileNotFoundError(f"Resume requested, but state file not found: {resume_state_file_path}")
 
     logger = _setup_file_logger(log_file)
     _append_event(
@@ -680,8 +522,8 @@ def main() -> None:
             "args": _serialize_args(args),
             "log_file": str(log_file),
             "events_file": str(events_file),
-            "state_file": str(state_file),
-            "resume_state_file": str(resume_state_file),
+            "save_state_file_path": str(save_state_file_path),
+            "resume_state_file_path": str(resume_state_file_path),
         },
     )
 
@@ -725,7 +567,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     use_cuda = device.type == "cuda"
-    use_amp = bool(args.amp and use_cuda)
+    use_amp = use_cuda
     torch.backends.cudnn.benchmark = use_cuda
 
     train_loader = DataLoader(
@@ -753,36 +595,10 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
 
-    hard_sample_loader = None
-    hard_sample_source = None
-    if args.hard_sample_report_file is not None:
-        if args.hard_sample_split == "train":
-            hard_sample_source = bundle.train_build_samples
-        else:
-            hard_sample_source = bundle.val_build_samples
-
-        hard_sample_ds = MinecraftBuildBagDataset(
-            hard_sample_source,
-            transform=eval_tf,
-            max_images_per_build=args.max_images_per_build,
-            train_mode=False,
-            return_index=True,
-        )
-        hard_sample_loader = DataLoader(
-            hard_sample_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=use_cuda,
-            persistent_workers=args.num_workers > 0,
-        )
-
     model = make_model(
         num_classes=len(bundle.idx_to_tag),
         dropout=args.dropout,
         backbone_name=args.backbone_name,
-        pretrained_backbone=bool(args.pretrained_backbone),
-        class_specific_attention=bool(args.class_specific_attention),
     ).to(device)
 
     backbone_frozen = False
@@ -814,53 +630,37 @@ def main() -> None:
     start_epoch = 1
 
     if args.resume:
-        resume_state = torch.load(resume_state_file, map_location=device, weights_only=False)
+        resume_state = torch.load(resume_state_file_path, map_location=device, weights_only=False)
 
-        resume_idx_to_tag = resume_state.get("idx_to_tag")
-        if resume_idx_to_tag is not None and list(resume_idx_to_tag) != list(bundle.idx_to_tag):
+        resume_idx_to_tag = resume_state["idx_to_tag"]
+        if list(resume_idx_to_tag) != list(bundle.idx_to_tag):
             raise ValueError(
                 "Resume state classes do not match current dataset classes. "
                 f"State classes={resume_idx_to_tag}, current classes={bundle.idx_to_tag}"
             )
 
         model.load_state_dict(resume_state["model_state_dict"])
-        if "optimizer_state_dict" in resume_state:
-            try:
-                optimizer.load_state_dict(resume_state["optimizer_state_dict"])
-            except ValueError as exc:
-                _log(
-                    logger,
-                    "[Resume] Optimizer state is incompatible with current param groups; "
-                    f"reinitializing optimizer state ({exc}).",
-                )
-                _append_event(
-                    events_file,
-                    {
-                        "event": "resume_optimizer_state_incompatible",
-                        "reason": str(exc),
-                    },
-                )
-        if "scaler_state_dict" in resume_state:
-            scaler.load_state_dict(resume_state["scaler_state_dict"])
+        optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        scaler.load_state_dict(resume_state["scaler_state_dict"])
 
-        history = list(resume_state.get("history", []))
-        step_losses = list(resume_state.get("train_step_losses", []))
-        train_epoch_losses = list(resume_state.get("train_epoch_losses", []))
-        val_epoch_losses = list(resume_state.get("val_epoch_losses", []))
+        history = list(resume_state["history"])
+        step_losses = list(resume_state["train_step_losses"])
+        train_epoch_losses = list(resume_state["train_epoch_losses"])
+        val_epoch_losses = list(resume_state["val_epoch_losses"])
 
-        global_step = int(resume_state.get("global_step", 0))
-        best_val_loss = float(resume_state.get("best_val_loss", best_val_loss))
-        best_val_objective = float(resume_state.get("best_val_objective", best_val_objective))
-        epochs_without_improve = int(resume_state.get("epochs_without_improve", epochs_without_improve))
+        global_step = int(resume_state["global_step"])
+        best_val_loss = float(resume_state["best_val_loss"])
+        best_val_objective = float(resume_state["best_val_objective"])
+        epochs_without_improve = int(resume_state["epochs_without_improve"])
 
-        resume_epoch = int(resume_state.get("epoch", 0))
-        epoch_completed = bool(resume_state.get("epoch_completed", True))
+        resume_epoch = int(resume_state["epoch"])
+        epoch_completed = bool(resume_state["epoch_completed"])
         start_epoch = max(resume_epoch + 1, 1) if epoch_completed else max(resume_epoch, 1)
 
-        backbone_frozen = bool(resume_state.get("backbone_frozen", backbone_frozen))
+        backbone_frozen = bool(resume_state["backbone_frozen"])
         model.set_backbone_trainable(not backbone_frozen)
 
-        _log(logger, f"[Resume] Loaded state: {resume_state_file}")
+        _log(logger, f"[Resume] Loaded state: {resume_state_file_path}")
         _log(
             logger,
             f"[Resume] start_epoch={start_epoch}, global_step={global_step}, "
@@ -870,7 +670,7 @@ def main() -> None:
             events_file,
             {
                 "event": "resume_loaded",
-                "resume_state_file": str(resume_state_file),
+                "resume_state_file_path": str(resume_state_file_path),
                 "start_epoch": start_epoch,
                 "global_step": global_step,
                 "best_val_loss": best_val_loss,
@@ -888,11 +688,11 @@ def main() -> None:
     _log(logger, f"AMP enabled: {use_amp}")
     _log(logger, "Model arch: pretrained_mil")
     _log(logger, f"Backbone: {args.backbone_name}")
-    _log(logger, f"Pretrained backbone: {bool(args.pretrained_backbone)}")
-    _log(logger, f"Class-specific attention: {bool(args.class_specific_attention)}")
+    _log(logger, "Attention mode: class_specific_only")
     _log(logger, f"Freeze backbone epochs: {args.freeze_backbone_epochs}")
     _log(logger, f"Head LR: {args.lr}")
     _log(logger, f"Backbone LR: {backbone_lr}")
+    _log(logger, f"Weight decay: {args.weight_decay}")
     _log(logger, f"Dropout: {args.dropout}")
     _log(logger, f"Optimizer: {optimizer_name}")
     _log(logger, f"Grad accumulation steps: {args.grad_accum_steps}")
@@ -902,12 +702,6 @@ def main() -> None:
         f"Loss: ASL(gamma_neg={args.asl_gamma_neg:.3f}, gamma_pos={args.asl_gamma_pos:.3f}, "
         f"clip={args.asl_clip:.3f}, eps={args.asl_eps:.1e})",
     )
-    if args.hard_sample_report_file is not None:
-        _log(
-            logger,
-            f"Hard-sample report: split={args.hard_sample_split}, top_k={args.hard_sample_topk}, "
-            f"path={args.hard_sample_report_file}"
-        )
     _log(logger, f"Max images per build: {args.max_images_per_build}")
     _log(logger, f"Train builds: {len(train_ds)}, Val builds: {len(val_ds)}, Test builds: {len(test_ds)}")
     _log(logger, f"Classes ({len(bundle.idx_to_tag)}): {bundle.idx_to_tag}")
@@ -917,7 +711,7 @@ def main() -> None:
     _log(logger, f"Latest loss plot: {loss_plot_file}")
     _log(logger, f"Debug log file: {log_file}")
     _log(logger, f"Events file: {events_file}")
-    _log(logger, f"State file: {state_file}")
+    _log(logger, f"State file: {save_state_file_path}")
 
     current_epoch = max(start_epoch - 1, 0)
     interrupted = False
@@ -945,7 +739,7 @@ def main() -> None:
                     logits = model(images, mask)
                     loss = criterion(logits, targets)
 
-                loss_to_backprop = loss / max(args.grad_accum_steps, 1)
+                loss_to_backprop = loss / args.grad_accum_steps
                 scaler.scale(loss_to_backprop).backward()
 
                 batch_size = images.size(0)
@@ -954,7 +748,7 @@ def main() -> None:
                 train_running_count += batch_size
                 step_losses.append(loss_value)
 
-                should_step = (batch_idx % max(args.grad_accum_steps, 1) == 0) or (batch_idx == num_train_batches)
+                should_step = (batch_idx % args.grad_accum_steps == 0) or (batch_idx == num_train_batches)
                 if should_step:
                     scaler.unscale_(optimizer)
                     if args.max_grad_norm > 0:
@@ -980,7 +774,7 @@ def main() -> None:
                         global_step=global_step,
                     )
                     _save_training_state(
-                        state_file=state_file,
+                        state_file=save_state_file_path,
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
@@ -1031,24 +825,14 @@ def main() -> None:
                 device=device,
                 use_amp=use_amp,
             )
-            val_preds_global_epoch = (val_probs_epoch >= args.threshold).float()
-            val_metrics_global_epoch = _compute_micro_metrics_from_preds(val_preds_global_epoch, val_targets_epoch)
-            val_set_global_epoch = _compute_set_match_metrics_from_preds(val_preds_global_epoch, val_targets_epoch)
-
-            epoch_objective_threshold, _ = _search_global_threshold_for_set_match(
+            class_threshold_values_epoch, _ = _search_classwise_thresholds_for_binary_f1(
                 probs=val_probs_epoch,
                 targets=val_targets_epoch,
-                default_threshold=args.threshold,
             )
-            val_preds_objective_epoch = (val_probs_epoch >= epoch_objective_threshold).float()
-            val_metrics_objective_epoch = _compute_micro_metrics_from_preds(
-                val_preds_objective_epoch,
-                val_targets_epoch,
-            )
-            val_set_objective_epoch = _compute_set_match_metrics_from_preds(
-                val_preds_objective_epoch,
-                val_targets_epoch,
-            )
+            val_preds_classwise_epoch = _apply_threshold_vector(val_probs_epoch, class_threshold_values_epoch)
+            val_metrics_classwise_epoch = _compute_micro_metrics_from_preds(val_preds_classwise_epoch, val_targets_epoch)
+            val_macro_classwise_epoch = _compute_macro_metrics_from_preds(val_preds_classwise_epoch, val_targets_epoch)
+            val_set_classwise_epoch = _compute_set_match_metrics_from_preds(val_preds_classwise_epoch, val_targets_epoch)
 
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -1058,17 +842,17 @@ def main() -> None:
                 "lr": current_lr,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "objective_threshold_epoch": epoch_objective_threshold,
-                "precision_micro_global": val_metrics_global_epoch["precision_micro"],
-                "recall_micro_global": val_metrics_global_epoch["recall_micro"],
-                "f1_micro_global": val_metrics_global_epoch["f1_micro"],
-                "sample_f1_global": val_set_global_epoch["sample_f1"],
-                "exact_match_global": val_set_global_epoch["exact_match_ratio"],
-                "precision_micro_objective": val_metrics_objective_epoch["precision_micro"],
-                "recall_micro_objective": val_metrics_objective_epoch["recall_micro"],
-                "f1_micro_objective": val_metrics_objective_epoch["f1_micro"],
-                "sample_f1_objective": val_set_objective_epoch["sample_f1"],
-                "exact_match_objective": val_set_objective_epoch["exact_match_ratio"],
+                "class_threshold_min": min(class_threshold_values_epoch),
+                "class_threshold_mean": sum(class_threshold_values_epoch) / max(len(class_threshold_values_epoch), 1),
+                "class_threshold_max": max(class_threshold_values_epoch),
+                "precision_micro_class_threshold": val_metrics_classwise_epoch["precision_micro"],
+                "recall_micro_class_threshold": val_metrics_classwise_epoch["recall_micro"],
+                "f1_micro_class_threshold": val_metrics_classwise_epoch["f1_micro"],
+                "precision_macro_class_threshold": val_macro_classwise_epoch["precision_macro"],
+                "recall_macro_class_threshold": val_macro_classwise_epoch["recall_macro"],
+                "f1_macro_class_threshold": val_macro_classwise_epoch["f1_macro"],
+                "sample_f1_class_threshold": val_set_classwise_epoch["sample_f1"],
+                "exact_match_class_threshold": val_set_classwise_epoch["exact_match_ratio"],
             }
             history.append(row)
             train_epoch_losses.append(train_loss)
@@ -1088,12 +872,11 @@ def main() -> None:
                 f"lr={current_lr:.6g} | "
                 f"train_loss={train_loss:.4f} | "
                 f"val_loss={val_loss:.4f} | "
-                f"val_sample_f1_objective={val_set_objective_epoch['sample_f1']:.4f} | "
-                f"val_sample_f1_global={val_set_global_epoch['sample_f1']:.4f}"
+                f"val_sample_f1_class_threshold={val_set_classwise_epoch['sample_f1']:.4f}",
             )
             _append_event(events_file, {"event": "epoch_end", **row})
 
-            objective_score = val_set_objective_epoch["sample_f1"]
+            objective_score = val_set_classwise_epoch["sample_f1"]
             if objective_score > best_val_objective + 1e-12:
                 best_val_objective = objective_score
                 best_val_loss = val_loss
@@ -1109,13 +892,20 @@ def main() -> None:
                         "dropout": args.dropout,
                         "model_arch": "pretrained_mil",
                         "backbone_name": args.backbone_name,
-                        "pretrained_backbone": bool(args.pretrained_backbone),
-                        "class_specific_attention": bool(args.class_specific_attention),
+                        "attention_mode": "class_specific_only",
                         "freeze_backbone_epochs": args.freeze_backbone_epochs,
                         "max_images_per_build": args.max_images_per_build,
                         "best_val_loss": best_val_loss,
                         "best_val_objective": best_val_objective,
-                        "objective_threshold": float(epoch_objective_threshold),
+                        "class_thresholds": {
+                            bundle.idx_to_tag[i]: float(class_threshold_values_epoch[i])
+                            for i in range(len(bundle.idx_to_tag))
+                        },
+                        "threshold_grid": {
+                            "min": THRESHOLD_GRID_MIN,
+                            "max": THRESHOLD_GRID_MAX,
+                            "step": THRESHOLD_GRID_STEP,
+                        },
                     },
                     best_ckpt,
                 )
@@ -1133,7 +923,7 @@ def main() -> None:
                 epochs_without_improve += 1
 
             _save_training_state(
-                state_file=state_file,
+                state_file=save_state_file_path,
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -1160,7 +950,7 @@ def main() -> None:
         interrupted = True
         _log(logger, "[Interrupt] KeyboardInterrupt captured, saving resumable state...")
         _save_training_state(
-            state_file=state_file,
+            state_file=save_state_file_path,
             model=model,
             optimizer=optimizer,
             scaler=scaler,
@@ -1184,19 +974,17 @@ def main() -> None:
                 "event": "interrupt_saved",
                 "epoch": max(current_epoch, 0),
                 "global_step": global_step,
-                "state_file": str(state_file),
+                "save_state_file_path": str(save_state_file_path),
             },
         )
 
     if interrupted:
-        _log(logger, f"Saved resumable state: {state_file}")
+        _log(logger, f"Saved resumable state: {save_state_file_path}")
         _log(logger, "Training interrupted. Resume with: python scripts/run_train.py --resume")
         return
 
     if not best_ckpt.exists():
-        raise FileNotFoundError(
-            f"Best checkpoint not found after training: {best_ckpt}"
-        )
+        raise FileNotFoundError(f"Best checkpoint not found after training: {best_ckpt}")
 
     checkpoint = torch.load(best_ckpt, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -1204,81 +992,35 @@ def main() -> None:
     val_probs, val_targets = _collect_probs_targets(model, val_loader, device=device, use_amp=use_amp)
     test_probs, test_targets = _collect_probs_targets(model, test_loader, device=device, use_amp=use_amp)
 
-    objective_threshold, _ = _search_global_threshold_for_set_match(
-        probs=val_probs,
-        targets=val_targets,
-        default_threshold=float(checkpoint.get("objective_threshold", args.threshold)),
-    )
-
     class_threshold_values, _ = _search_classwise_thresholds_for_binary_f1(
         probs=val_probs,
         targets=val_targets,
-        default_threshold=objective_threshold,
     )
 
-    val_preds_global = (val_probs >= args.threshold).float()
-    val_preds_objective = (val_probs >= objective_threshold).float()
-
-    test_preds_global = (test_probs >= args.threshold).float()
-    test_preds_objective = (test_probs >= objective_threshold).float()
     val_preds_classwise = _apply_threshold_vector(val_probs, class_threshold_values)
     test_preds_classwise = _apply_threshold_vector(test_probs, class_threshold_values)
 
-    val_metrics_global = _compute_micro_metrics_from_preds(val_preds_global, val_targets)
-    val_metrics_objective = _compute_micro_metrics_from_preds(val_preds_objective, val_targets)
-    test_metrics_global = _compute_micro_metrics_from_preds(test_preds_global, test_targets)
-    test_metrics = _compute_micro_metrics_from_preds(test_preds_objective, test_targets)
     val_metrics_classwise = _compute_micro_metrics_from_preds(val_preds_classwise, val_targets)
     test_metrics_classwise = _compute_micro_metrics_from_preds(test_preds_classwise, test_targets)
 
-    val_macro_global = _compute_macro_metrics_from_preds(val_preds_global, val_targets)
-    val_macro_objective = _compute_macro_metrics_from_preds(val_preds_objective, val_targets)
     val_macro_classwise = _compute_macro_metrics_from_preds(val_preds_classwise, val_targets)
-    test_macro_global = _compute_macro_metrics_from_preds(test_preds_global, test_targets)
-    test_macro_objective = _compute_macro_metrics_from_preds(test_preds_objective, test_targets)
     test_macro_classwise = _compute_macro_metrics_from_preds(test_preds_classwise, test_targets)
 
-    val_set_global = _compute_set_match_metrics_from_preds(val_preds_global, val_targets)
-    val_set_objective = _compute_set_match_metrics_from_preds(val_preds_objective, val_targets)
-    test_set_global = _compute_set_match_metrics_from_preds(test_preds_global, test_targets)
-    test_set_objective = _compute_set_match_metrics_from_preds(test_preds_objective, test_targets)
     val_set_classwise = _compute_set_match_metrics_from_preds(val_preds_classwise, val_targets)
     test_set_classwise = _compute_set_match_metrics_from_preds(test_preds_classwise, test_targets)
 
-    checkpoint_threshold_mode = "classwise"
-    if val_macro_classwise["f1_macro"] + 1e-12 < val_macro_objective["f1_macro"]:
-        checkpoint_threshold_mode = "global"
-
-    checkpoint["global_threshold"] = float(objective_threshold)
-    checkpoint["objective_threshold"] = float(objective_threshold)
-    checkpoint["class_specific_attention"] = bool(args.class_specific_attention)
+    checkpoint["attention_mode"] = "class_specific_only"
     checkpoint["class_thresholds"] = {
         bundle.idx_to_tag[i]: float(class_threshold_values[i]) for i in range(len(bundle.idx_to_tag))
     }
-    checkpoint["threshold_mode"] = checkpoint_threshold_mode
-    checkpoint["primary_metric_mode"] = (
-        "classwise_macro_f1" if checkpoint_threshold_mode == "classwise" else "global_macro_f1"
-    )
     checkpoint["threshold_grid"] = {
         "min": THRESHOLD_GRID_MIN,
         "max": THRESHOLD_GRID_MAX,
         "step": THRESHOLD_GRID_STEP,
     }
-    checkpoint["val_metrics_global_threshold"] = val_metrics_global
-    checkpoint["val_macro_metrics_global_threshold"] = val_macro_global
-    checkpoint["val_set_match_global_threshold"] = val_set_global
-    checkpoint["val_metrics_objective_threshold"] = val_metrics_objective
-    checkpoint["val_macro_metrics_objective_threshold"] = val_macro_objective
-    checkpoint["val_set_match_objective_threshold"] = val_set_objective
     checkpoint["val_metrics_class_threshold"] = val_metrics_classwise
     checkpoint["val_macro_metrics_class_threshold"] = val_macro_classwise
     checkpoint["val_set_match_class_threshold"] = val_set_classwise
-    checkpoint["test_metrics_global_threshold"] = test_metrics_global
-    checkpoint["test_macro_metrics_global_threshold"] = test_macro_global
-    checkpoint["test_set_match_global_threshold"] = test_set_global
-    checkpoint["test_metrics_objective_threshold"] = test_metrics
-    checkpoint["test_macro_metrics_objective_threshold"] = test_macro_objective
-    checkpoint["test_set_match_objective_threshold"] = test_set_objective
     checkpoint["test_metrics_class_threshold"] = test_metrics_classwise
     checkpoint["test_macro_metrics_class_threshold"] = test_macro_classwise
     checkpoint["test_set_match_class_threshold"] = test_set_classwise
@@ -1298,31 +1040,6 @@ def main() -> None:
     )
     _log(
         logger,
-        "Validation metrics (objective threshold, preferred) | "
-        f"precision_micro={val_metrics_objective['precision_micro']:.4f} | "
-        f"recall_micro={val_metrics_objective['recall_micro']:.4f} | "
-        f"f1_micro={val_metrics_objective['f1_micro']:.4f} | "
-        f"precision_macro={val_macro_objective['precision_macro']:.4f} | "
-        f"recall_macro={val_macro_objective['recall_macro']:.4f} | "
-        f"f1_macro={val_macro_objective['f1_macro']:.4f} | "
-        f"sample_f1={val_set_objective['sample_f1']:.4f} | "
-        f"exact_match={val_set_objective['exact_match_ratio']:.4f} | "
-        f"threshold={objective_threshold:.2f}"
-    )
-    _log(
-        logger,
-        f"Validation metrics (global={args.threshold:.2f}, reference) | "
-        f"precision_micro={val_metrics_global['precision_micro']:.4f} | "
-        f"recall_micro={val_metrics_global['recall_micro']:.4f} | "
-        f"f1_micro={val_metrics_global['f1_micro']:.4f} | "
-        f"precision_macro={val_macro_global['precision_macro']:.4f} | "
-        f"recall_macro={val_macro_global['recall_macro']:.4f} | "
-        f"f1_macro={val_macro_global['f1_macro']:.4f} | "
-        f"sample_f1={val_set_global['sample_f1']:.4f} | "
-        f"exact_match={val_set_global['exact_match_ratio']:.4f}"
-    )
-    _log(
-        logger,
         "Test metrics (classwise thresholds, preferred) | "
         f"precision_micro={test_metrics_classwise['precision_micro']:.4f} | "
         f"recall_micro={test_metrics_classwise['recall_micro']:.4f} | "
@@ -1333,52 +1050,14 @@ def main() -> None:
         f"sample_f1={test_set_classwise['sample_f1']:.4f} | "
         f"exact_match={test_set_classwise['exact_match_ratio']:.4f}"
     )
-    _log(
-        logger,
-        "Test metrics (objective threshold, preferred) | "
-        f"precision_micro={test_metrics['precision_micro']:.4f} | "
-        f"recall_micro={test_metrics['recall_micro']:.4f} | "
-        f"f1_micro={test_metrics['f1_micro']:.4f} | "
-        f"precision_macro={test_macro_objective['precision_macro']:.4f} | "
-        f"recall_macro={test_macro_objective['recall_macro']:.4f} | "
-        f"f1_macro={test_macro_objective['f1_macro']:.4f} | "
-        f"sample_f1={test_set_objective['sample_f1']:.4f} | "
-        f"exact_match={test_set_objective['exact_match_ratio']:.4f}"
-    )
-    _log(
-        logger,
-        f"Test metrics (global={args.threshold:.2f}, reference) | "
-        f"precision_micro={test_metrics_global['precision_micro']:.4f} | "
-        f"recall_micro={test_metrics_global['recall_micro']:.4f} | "
-        f"f1_micro={test_metrics_global['f1_micro']:.4f} | "
-        f"precision_macro={test_macro_global['precision_macro']:.4f} | "
-        f"recall_macro={test_macro_global['recall_macro']:.4f} | "
-        f"f1_macro={test_macro_global['f1_macro']:.4f} | "
-        f"sample_f1={test_set_global['sample_f1']:.4f} | "
-        f"exact_match={test_set_global['exact_match_ratio']:.4f}"
-    )
-
-    if args.hard_sample_report_file is not None and hard_sample_loader is not None and hard_sample_source is not None:
-        _export_hard_sample_report(
-            model=model,
-            loader=hard_sample_loader,
-            samples=hard_sample_source,
-            idx_to_tag=bundle.idx_to_tag,
-            device=device,
-            use_amp=use_amp,
-            output_file=args.hard_sample_report_file,
-            top_k=args.hard_sample_topk,
-        )
-        _log(logger, f"Saved hard-sample report: {args.hard_sample_report_file}")
 
     metrics_out = {
         "model_arch": "pretrained_mil",
         "backbone_name": args.backbone_name,
-        "pretrained_backbone": bool(args.pretrained_backbone),
-        "class_specific_attention": bool(args.class_specific_attention),
+        "attention_mode": "class_specific_only",
         "freeze_backbone_epochs": args.freeze_backbone_epochs,
         "resume": bool(args.resume),
-        "resumed_from": str(resume_state_file) if args.resume else None,
+        "resumed_from": str(resume_state_file_path) if args.resume else None,
         "max_images_per_build": args.max_images_per_build,
         "dropout": args.dropout,
         "optimizer": optimizer_name,
@@ -1389,20 +1068,12 @@ def main() -> None:
         "asl_eps": args.asl_eps,
         "lr": args.lr,
         "backbone_lr": backbone_lr,
+        "weight_decay": args.weight_decay,
         "grad_accum_steps": args.grad_accum_steps,
         "max_grad_norm": args.max_grad_norm,
-        "hard_sample_report_file": str(args.hard_sample_report_file) if args.hard_sample_report_file else None,
-        "hard_sample_topk": args.hard_sample_topk,
-        "hard_sample_split": args.hard_sample_split,
-        "global_threshold": float(args.threshold),
-        "objective_threshold": float(objective_threshold),
         "class_thresholds": {
             bundle.idx_to_tag[i]: float(class_threshold_values[i]) for i in range(len(bundle.idx_to_tag))
         },
-        "threshold_mode": checkpoint_threshold_mode,
-        "primary_metric_mode": (
-            "classwise_macro_f1" if checkpoint_threshold_mode == "classwise" else "global_macro_f1"
-        ),
         "threshold_grid": {
             "min": THRESHOLD_GRID_MIN,
             "max": THRESHOLD_GRID_MAX,
@@ -1410,21 +1081,12 @@ def main() -> None:
         },
         "best_val_loss": best_val_loss,
         "best_val_objective": best_val_objective,
-        "val_metrics_global_threshold": val_metrics_global,
-        "val_macro_metrics_global_threshold": val_macro_global,
-        "val_set_match_global_threshold": val_set_global,
-        "val_metrics_objective_threshold": val_metrics_objective,
-        "val_macro_metrics_objective_threshold": val_macro_objective,
-        "val_set_match_objective_threshold": val_set_objective,
         "val_metrics_class_threshold": val_metrics_classwise,
         "val_macro_metrics_class_threshold": val_macro_classwise,
         "val_set_match_class_threshold": val_set_classwise,
-        "test_metrics_global_threshold": test_metrics_global,
-        "test_macro_metrics_global_threshold": test_macro_global,
-        "test_set_match_global_threshold": test_set_global,
-        "test_metrics": test_metrics,
-        "test_macro_metrics": test_macro_objective,
-        "test_set_match_metrics": test_set_objective,
+        "test_metrics": test_metrics_classwise,
+        "test_macro_metrics": test_macro_classwise,
+        "test_set_match_metrics": test_set_classwise,
         "test_metrics_class_threshold": test_metrics_classwise,
         "test_macro_metrics_class_threshold": test_macro_classwise,
         "test_set_match_class_threshold": test_set_classwise,
@@ -1434,7 +1096,7 @@ def main() -> None:
         "val_epoch_losses": val_epoch_losses,
         "classes": bundle.idx_to_tag,
         "checkpoint": str(best_ckpt),
-        "state_file": str(state_file),
+        "save_state_file_path": str(save_state_file_path),
         "debug_log_file": str(log_file),
         "events_file": str(events_file),
         "latest_loss_plot": str(loss_plot_file),
@@ -1446,7 +1108,7 @@ def main() -> None:
 
     final_epoch = int(history[-1]["epoch"]) if history else max(current_epoch, 0)
     _save_training_state(
-        state_file=state_file,
+        state_file=save_state_file_path,
         model=model,
         optimizer=optimizer,
         scaler=scaler,
@@ -1475,13 +1137,13 @@ def main() -> None:
             "best_val_objective": best_val_objective,
             "metrics_file": str(metrics_file),
             "best_ckpt": str(best_ckpt),
-            "state_file": str(state_file),
+            "save_state_file_path": str(save_state_file_path),
         },
     )
 
     _log(logger, f"Saved checkpoint: {best_ckpt}")
     _log(logger, f"Saved metrics: {metrics_file}")
-    _log(logger, f"Saved state: {state_file}")
+    _log(logger, f"Saved state: {save_state_file_path}")
 
 
 if __name__ == "__main__":
