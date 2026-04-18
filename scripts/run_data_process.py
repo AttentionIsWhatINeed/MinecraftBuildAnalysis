@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-k-tags",
         type=int,
-        default=20,
+        default=30,
         help="Automatically keep only top-k frequent tags after blacklist/threshold filtering. Use 0 to keep all.",
     )
     parser.add_argument("--train-ratio", type=float, default=0.7, help="Training split ratio")

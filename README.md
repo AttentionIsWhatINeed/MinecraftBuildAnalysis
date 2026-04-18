@@ -191,6 +191,7 @@ Model architecture:
 Training configuration:
 - Loss: ASL (Asymmetric Loss)
 - Optimizer: AdamW
+- Configurable data augmentation (flip/jitter/rotation/random crop/random erasing)
 - Mixed precision when CUDA is available
 - Gradient clipping and optional gradient accumulation
 - Early stopping

@@ -10,12 +10,12 @@ import torch
 from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision import transforms
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.train.dataset import MinecraftBuildBagDataset, build_datasets
+from src.train.augmentation import AugmentationConfig, build_train_eval_transforms
 from src.train.engine import run_epoch
 from src.train.modeling import make_model, resolve_device
 from src.train.utils import set_seed
@@ -64,6 +64,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--disable-augmentation",
+        action="store_true",
+        help="Disable training-time data augmentation and use eval preprocessing only.",
+    )
+    parser.add_argument(
+        "--aug-hflip-prob",
+        type=float,
+        default=0.5,
+        help="Random horizontal flip probability for training images.",
+    )
+    parser.add_argument(
+        "--aug-color-jitter",
+        type=float,
+        default=0.2,
+        help="Color jitter strength (brightness/contrast/saturation) for training images.",
+    )
+    parser.add_argument(
+        "--aug-rotation-degrees",
+        type=float,
+        default=15,
+        help="Random rotation range in degrees for training images.",
+    )
+    parser.add_argument(
+        "--aug-random-resized-crop-scale-min",
+        type=float,
+        default=0.85,
+        help="Min scale for RandomResizedCrop. Set <1.0 to enable random crop/zoom.",
+    )
+    parser.add_argument(
+        "--aug-random-erasing-prob",
+        type=float,
+        default=0.15,
+        help="RandomErasing probability applied after tensor conversion.",
+    )
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument(
         "--asl-gamma-neg",
@@ -503,6 +538,15 @@ def main() -> None:
     if args.weight_decay < 0:
         raise ValueError("--weight-decay must be >= 0")
 
+    augmentation_config = AugmentationConfig(
+        enabled=not args.disable_augmentation,
+        hflip_prob=args.aug_hflip_prob,
+        color_jitter_strength=args.aug_color_jitter,
+        rotation_degrees=args.aug_rotation_degrees,
+        random_resized_crop_scale_min=args.aug_random_resized_crop_scale_min,
+        random_erasing_prob=args.aug_random_erasing_prob,
+    )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir = args.snapshot_dir or (args.output_dir / "snapshots")
     loss_plot_file = args.loss_plot_file or (args.output_dir / "latest_loss_curve.png")
@@ -529,21 +573,9 @@ def main() -> None:
 
     bundle = build_datasets(args.train_json, args.val_json, args.test_json, ROOT)
 
-    train_tf = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    eval_tf = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
+    train_tf, eval_tf = build_train_eval_transforms(
+        image_size=args.image_size,
+        config=augmentation_config,
     )
 
     train_ds = MinecraftBuildBagDataset(
@@ -697,6 +729,16 @@ def main() -> None:
     _log(logger, f"Optimizer: {optimizer_name}")
     _log(logger, f"Grad accumulation steps: {args.grad_accum_steps}")
     _log(logger, f"Max grad norm: {args.max_grad_norm}")
+    _log(logger, f"Data augmentation enabled: {augmentation_config.enabled}")
+    _log(
+        logger,
+        "Data augmentation config: "
+        f"hflip={augmentation_config.hflip_prob:.3f}, "
+        f"jitter={augmentation_config.color_jitter_strength:.3f}, "
+        f"rotation={augmentation_config.rotation_degrees:.3f}, "
+        f"resized_crop_min={augmentation_config.random_resized_crop_scale_min:.3f}, "
+        f"random_erasing={augmentation_config.random_erasing_prob:.3f}",
+    )
     _log(
         logger,
         f"Loss: ASL(gamma_neg={args.asl_gamma_neg:.3f}, gamma_pos={args.asl_gamma_pos:.3f}, "
