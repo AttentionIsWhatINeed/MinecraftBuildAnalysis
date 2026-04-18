@@ -3,6 +3,8 @@
 # Tags listed here will be removed from each build during processing.
 BLACKLIST_TAGS = [
     "medieval",
+    "youtube",
+    "medieval house"
 ]
 
 

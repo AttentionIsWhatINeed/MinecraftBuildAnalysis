@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         default=1e-8,
         help="ASL epsilon for numerical stability.",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(
         "--max-images-per-build",
         type=int,

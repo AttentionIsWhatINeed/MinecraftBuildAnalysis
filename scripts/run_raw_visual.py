@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-n-tags",
         type=int,
-        default=20,
+        default=50,
         help="Number of top tags to render",
     )
     return parser.parse_args()

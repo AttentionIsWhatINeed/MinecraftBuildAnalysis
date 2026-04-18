@@ -92,7 +92,7 @@ class RawDataVisualizer:
             max_images_per_build=max(image_counts) if image_counts else 0,
         )
 
-    def save_visualizations(self, output_dir: str = "outputs/raw_visualization", top_n_tags: int = 20) -> Dict[str, str]:
+    def save_visualizations(self, output_dir: str = "outputs/raw_visualization", top_n_tags: int = 50) -> Dict[str, str]:
         try:
             import matplotlib.pyplot as plt
         except ImportError as exc:
@@ -113,10 +113,13 @@ class RawDataVisualizer:
 
         # 1) Distribution of images per build
         plt.figure(figsize=(10, 6))
-        plt.hist(image_counts, bins=20, color="#3E7CB1", edgecolor="black", alpha=0.85)
+        max_images = max(image_counts) if image_counts else 0
+        image_bins = range(0, max_images + 2)
+        plt.hist(image_counts, bins=image_bins, align="left", color="#3E7CB1", edgecolor="black", alpha=0.85)
         plt.title("Raw Data: Images per Build Distribution")
         plt.xlabel("Images per Build")
         plt.ylabel("Number of Builds")
+        plt.xticks(range(0, max_images + 1))
         plt.grid(axis="y", linestyle="--", alpha=0.3)
         path_images = out / "raw_images_per_build_hist.png"
         plt.tight_layout()

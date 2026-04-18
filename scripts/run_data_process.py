@@ -34,7 +34,7 @@ class GenerateConfig:
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
-    seed: int = 42
+    seed: int = 13
     metadata_file: str = "data/raw/metadata/builds_metadata.json"
     output_dir: str = "data/processed"
 
@@ -58,13 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-k-tags",
         type=int,
-        default=30,
+        default=20,
         help="Automatically keep only top-k frequent tags after blacklist/threshold filtering. Use 0 to keep all.",
     )
     parser.add_argument("--train-ratio", type=float, default=0.7, help="Training split ratio")
     parser.add_argument("--val-ratio", type=float, default=0.15, help="Validation split ratio")
     parser.add_argument("--test-ratio", type=float, default=0.15, help="Test split ratio")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=13, help="Random seed")
     parser.add_argument(
         "--metadata-file",
         default="data/raw/metadata/builds_metadata.json",
