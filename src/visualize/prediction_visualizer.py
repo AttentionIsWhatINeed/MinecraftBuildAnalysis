@@ -79,7 +79,7 @@ class PredictionVisualizer:
             "exact_match_ratio": exact_match / n,
         }
 
-    def _select_example_rows(self, max_examples: int) -> List[Dict]:
+    def _prepare_example_rows(self, max_examples: int) -> List[Dict]:
         max_examples = max(1, int(max_examples))
         mismatched: List[Dict] = []
         matched: List[Dict] = []
@@ -92,10 +92,10 @@ class PredictionVisualizer:
             else:
                 mismatched.append(row)
 
-        selected = mismatched[:max_examples]
-        if len(selected) < max_examples:
-            selected.extend(matched[: max_examples - len(selected)])
-        return selected
+        display_rows = mismatched[:max_examples]
+        if len(display_rows) < max_examples:
+            display_rows.extend(matched[: max_examples - len(display_rows)])
+        return display_rows
 
     @staticmethod
     def _get_display_image_path(row: Dict) -> str:
@@ -248,7 +248,7 @@ class PredictionVisualizer:
         saved["tag_cardinality_hist"] = str(path_card)
 
         # Plot 5: limited examples with image + true/predicted tags
-        example_rows = self._select_example_rows(example_count)
+        example_rows = self._prepare_example_rows(example_count)
         cols = 3
         rows = max(1, int(math.ceil(len(example_rows) / cols)))
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 5.2, rows * 4.6))
@@ -302,7 +302,7 @@ class PredictionVisualizer:
         for ax in axes_list[len(example_rows) :]:
             ax.axis("off")
 
-        plt.suptitle(f"Prediction Examples: Image with True vs Predicted Tags (Top {len(example_rows)})")
+        plt.suptitle(f"Prediction Examples: Image with True vs Predicted Tags (Count: {len(example_rows)})")
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         path_examples = out / "prediction_examples_image_true_pred_tags.png"
         plt.savefig(path_examples, dpi=200)
