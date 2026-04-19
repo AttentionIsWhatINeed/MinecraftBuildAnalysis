@@ -1,5 +1,6 @@
 import json
-from collections import Counter
+import math
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -7,6 +8,8 @@ from typing import Dict, List
 
 class PredictionVisualizer:
     """Create plots and summary files for multi-label prediction results."""
+
+    DEFAULT_EXAMPLE_COUNT = 12
 
     def __init__(self, result: Dict):
         self.result = result
@@ -76,9 +79,85 @@ class PredictionVisualizer:
             "exact_match_ratio": exact_match / n,
         }
 
-    def save_visualizations(self, output_dir: str = "outputs/prediction_visualization") -> Dict[str, str]:
+    def _select_example_rows(self, max_examples: int) -> List[Dict]:
+        max_examples = max(1, int(max_examples))
+        mismatched: List[Dict] = []
+        matched: List[Dict] = []
+
+        for row in self.predictions:
+            true_tags = set(row.get("true_tags", []))
+            pred_tags = set(row.get("predicted_tags", []))
+            if true_tags == pred_tags:
+                matched.append(row)
+            else:
+                mismatched.append(row)
+
+        selected = mismatched[:max_examples]
+        if len(selected) < max_examples:
+            selected.extend(matched[: max_examples - len(selected)])
+        return selected
+
+    @staticmethod
+    def _get_display_image_path(row: Dict) -> str:
+        image_path = str(row.get("image_path", "") or "").strip()
+        if image_path:
+            return image_path
+
+        image_paths = row.get("image_paths", [])
+        if isinstance(image_paths, list) and image_paths:
+            return str(image_paths[0]).strip()
+        return ""
+
+    @staticmethod
+    def _format_tags(tags: List[str], max_items: int = 8) -> str:
+        safe_tags = [str(t) for t in tags]
+        if not safe_tags:
+            return "(none)"
+        if len(safe_tags) <= max_items:
+            return ", ".join(safe_tags)
+        remain = len(safe_tags) - max_items
+        return ", ".join(safe_tags[:max_items]) + f", ... (+{remain})"
+
+    @staticmethod
+    def _build_colored_tag_line_box(label: str, tags: List[str], matched_tags: set, max_items: int = 8):
+        from matplotlib.offsetbox import HPacker, TextArea
+
+        parts = [
+            TextArea(
+                f"{label}:",
+                textprops={
+                    "fontsize": 8,
+                    "fontweight": "bold",
+                    "color": "black",
+                },
+            )
+        ]
+
+        safe_tags = [str(t) for t in tags]
+        if not safe_tags:
+            parts.append(TextArea(" (none)", textprops={"fontsize": 8, "color": "#666666"}))
+            return HPacker(children=parts, align="baseline", pad=0, sep=2)
+
+        display_tags = safe_tags[:max_items]
+        for idx, tag in enumerate(display_tags):
+            color = "#2E7D32" if tag in matched_tags else "#C62828"
+            prefix = " " if idx == 0 else ", "
+            parts.append(TextArea(f"{prefix}{tag}", textprops={"fontsize": 8, "color": color}))
+
+        remain = len(safe_tags) - len(display_tags)
+        if remain > 0:
+            parts.append(TextArea(f", ... (+{remain})", textprops={"fontsize": 8, "color": "#555555"}))
+
+        return HPacker(children=parts, align="baseline", pad=0, sep=0)
+
+    def save_visualizations(
+        self,
+        output_dir: str = "outputs/prediction_visualization",
+        example_count: int = DEFAULT_EXAMPLE_COUNT,
+    ) -> Dict[str, str]:
         try:
             import matplotlib.pyplot as plt
+            from matplotlib.offsetbox import AnchoredOffsetbox, VPacker
         except ImportError as exc:
             raise ImportError(
                 "matplotlib is required for visualization. Install with: pip install matplotlib"
@@ -168,7 +247,84 @@ class PredictionVisualizer:
         plt.close()
         saved["tag_cardinality_hist"] = str(path_card)
 
+        # Plot 5: limited examples with image + true/predicted tags
+        example_rows = self._select_example_rows(example_count)
+        cols = 3
+        rows = max(1, int(math.ceil(len(example_rows) / cols)))
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 5.2, rows * 4.6))
+        axes_list = axes.ravel().tolist() if hasattr(axes, "ravel") else [axes]
+
+        for ax, row in zip(axes_list, example_rows):
+            image_path = self._get_display_image_path(row)
+            image_loaded = False
+
+            if image_path:
+                image_file = Path(image_path)
+                if image_file.exists():
+                    try:
+                        ax.imshow(plt.imread(image_file))
+                        image_loaded = True
+                    except Exception:
+                        image_loaded = False
+
+            if not image_loaded:
+                ax.set_facecolor("#F2F2F2")
+                ax.text(0.5, 0.5, "Image not available", ha="center", va="center", fontsize=9)
+
+            true_tags = row.get("true_tags", [])
+            pred_tags = row.get("predicted_tags", [])
+
+            title = row.get("title", "")
+            ax.set_title(textwrap.fill(str(title), width=55), fontsize=8)
+
+            true_set = set(true_tags)
+            pred_set = set(pred_tags)
+            true_line = self._build_colored_tag_line_box("True", true_tags, pred_set)
+            pred_line = self._build_colored_tag_line_box("Pred", pred_tags, true_set)
+            tags_box = VPacker(children=[true_line, pred_line], align="left", pad=0, sep=1)
+
+            anchored = AnchoredOffsetbox(
+                loc="lower left",
+                child=tags_box,
+                pad=0.2,
+                frameon=True,
+                bbox_to_anchor=(0.01, 0.01),
+                bbox_transform=ax.transAxes,
+                borderpad=0.2,
+            )
+            anchored.patch.set_facecolor("white")
+            anchored.patch.set_alpha(0.85)
+            anchored.patch.set_edgecolor("#DDDDDD")
+            ax.add_artist(anchored)
+
+            ax.axis("off")
+
+        for ax in axes_list[len(example_rows) :]:
+            ax.axis("off")
+
+        plt.suptitle(f"Prediction Examples: Image with True vs Predicted Tags (Top {len(example_rows)})")
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        path_examples = out / "prediction_examples_image_true_pred_tags.png"
+        plt.savefig(path_examples, dpi=200)
+        plt.close(fig)
+        saved["image_true_pred_examples"] = str(path_examples)
+
         # Save summary JSON
+        example_rows_summary = []
+        for row in example_rows:
+            true_tags = row.get("true_tags", [])
+            pred_tags = row.get("predicted_tags", [])
+            example_rows_summary.append(
+                {
+                    "title": row.get("title", ""),
+                    "build_url": row.get("build_url", ""),
+                    "image_path": self._get_display_image_path(row),
+                    "true_tags": true_tags,
+                    "predicted_tags": pred_tags,
+                    "exact_match": bool(set(true_tags) == set(pred_tags)),
+                }
+            )
+
         summary_path = out / "prediction_viz_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -182,6 +338,10 @@ class PredictionVisualizer:
                     },
                     "cardinality": cardinality_stats,
                     "per_class_metrics": per_class,
+                    "example_display": {
+                        "example_count": len(example_rows),
+                        "rows": example_rows_summary,
+                    },
                 },
                 f,
                 indent=2,
